@@ -76,63 +76,7 @@ create index if not exists idx_watchlist_daily_day_gm_count
   on watchlist_daily (day desc, gm_count desc);
 
 -- =========================
--- 3) PAID LAUNCH SLOTS
--- =========================
--- Exactly 5 slots per UTC day. Claimable on web only.
-
-create table if not exists launch_slots (
-  day date not null,                                      -- UTC day
-  slot int not null check (slot between 1 and 5),
-  price_sol numeric(18,9) not null default 1.0,
-  is_claimed boolean not null default false,
-  claimed_at timestamptz,
-  claim_id uuid,                                          -- link to launch_claims once claimed
-  primary key (day, slot)
-);
-
-create index if not exists idx_launch_slots_day
-  on launch_slots (day desc);
-
--- Claims record the payment + verified X identity.
--- Store tx signature to prevent duplicates.
-create table if not exists launch_claims (
-  id uuid primary key default gen_random_uuid(),
-  day date not null,
-  slot int not null check (slot between 1 and 5),
-  mint text not null,
-  token_name text,
-  token_symbol text,
-  x_user_id text not null,                                -- from X OAuth
-  x_handle text not null,
-  tx_signature text not null,
-  paid_amount_sol numeric(18,9) not null,
-  status text not null default 'confirmed' check (status in ('pending','confirmed','rejected','refunded')),
-  created_at timestamptz not null default now(),
-  unique (day, slot),
-  unique (tx_signature)
-);
-
-create index if not exists idx_launch_claims_day
-  on launch_claims (day desc);
-
--- Helpful view for "today's 5 launches"
-create or replace view launches_today as
-select
-  ls.day,
-  ls.slot,
-  ls.is_claimed,
-  lc.mint,
-  lc.token_name,
-  lc.token_symbol,
-  lc.x_handle,
-  lc.tx_signature,
-  true as is_paid_slot,
-  lc.created_at as claimed_created_at
-from launch_slots ls
-left join launch_claims lc on lc.id = ls.claim_id;
-
--- =========================
--- 4) TOKEN METADATA CACHE (OPTIONAL BUT VERY USEFUL)
+-- 3) TOKEN METADATA CACHE (OPTIONAL BUT VERY USEFUL)
 -- =========================
 -- Keeps your pipeline fast and avoids refetching supply/name/symbol constantly.
 
@@ -153,7 +97,7 @@ create index if not exists idx_token_cache_updated_at
   on token_cache (updated_at desc);
 
 -- =========================
--- 5) PUBLIC "LATEST JSON" SNAPSHOTS (TERMINAL/BOTS)
+-- 4) PUBLIC "LATEST JSON" SNAPSHOTS (TERMINAL/BOTS)
 -- =========================
 -- Store the most recent combined payload for ultra-fast reads.
 
@@ -169,8 +113,6 @@ create table if not exists public_snapshots (
 alter table trending_snapshots enable row level security;
 alter table trending_items enable row level security;
 alter table watchlist_daily enable row level security;
-alter table launch_slots enable row level security;
-alter table launch_claims enable row level security;
 alter table token_cache enable row level security;
 alter table public_snapshots enable row level security;
 
@@ -185,14 +127,6 @@ create policy "public read trending_items"
 
 create policy "public read watchlist_daily"
   on watchlist_daily for select
-  using (true);
-
-create policy "public read launch_slots"
-  on launch_slots for select
-  using (true);
-
-create policy "public read launch_claims (limited)"
-  on launch_claims for select
   using (true);
 
 create policy "public read token_cache"

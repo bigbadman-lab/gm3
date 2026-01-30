@@ -56,21 +56,10 @@ Deno.serve(async (_req) => {
       .limit(50);
     if (wlErr) throw wlErr;
 
-    // Launches today (view)
-    const { data: launches, error: lErr } = await supabase
-      .from("launches_today")
-      .select("*")
-      .eq("day", today)
-      .order("slot", { ascending: true });
-    if (lErr) throw lErr;
-
-    // Collect mints from trending, watchlist, and launches (when mint not null)
+    // Collect mints from trending and watchlist
     const mintsToLookup = new Set<string>();
     for (const t of trending) mintsToLookup.add(t.mint);
     for (const w of watchlist ?? []) mintsToLookup.add(w.mint);
-    for (const l of launches ?? []) {
-      if (l.mint != null) mintsToLookup.add(l.mint);
-    }
 
     // Fetch creator_wallet from token_cache for those mints
     const mintToCreator = new Map<string, string | null>();
@@ -90,9 +79,6 @@ Deno.serve(async (_req) => {
 
     const filteredTrending = trending.filter((t: { mint: string }) => !isBlocked(t.mint));
     const filteredWatchlist = (watchlist ?? []).filter((w: { mint: string }) => !isBlocked(w.mint));
-    const filteredLaunches = (launches ?? []).filter((l: { mint?: string | null }) =>
-      l.mint == null ? true : !isBlocked(l.mint)
-    );
 
     return new Response(
       JSON.stringify({
@@ -101,14 +87,21 @@ Deno.serve(async (_req) => {
         snapshot: snap ?? null,
         trending: filteredTrending,
         watchlist: filteredWatchlist,
-        launches: filteredLaunches,
       }),
       { headers: { "Content-Type": "application/json" } },
     );
-  } catch (e) {
-    return new Response(
-      JSON.stringify({ ok: false, error: String(e) }),
-      { status: 500, headers: { "Content-Type": "application/json" } },
-    );
+  } catch (err: unknown) {
+    const body: Record<string, unknown> = {
+      ok: false,
+      message: (err as Error)?.message ?? String(err),
+      name: (err as Error)?.name,
+    };
+    if (Deno.env.get("ENV") === "local") {
+      body.stack = (err as Error)?.stack;
+    }
+    return new Response(JSON.stringify(body), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
   }
 });
