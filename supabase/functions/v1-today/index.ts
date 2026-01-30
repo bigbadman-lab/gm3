@@ -12,6 +12,21 @@ Deno.serve(async (_req) => {
 
     const today = utcDayString();
 
+    // Blocklists (is_active only)
+    const { data: blockedMintsRows, error: bmErr } = await supabase
+      .from("blocked_mints")
+      .select("mint")
+      .eq("is_active", true);
+    if (bmErr) throw bmErr;
+    const blockedMints = new Set((blockedMintsRows ?? []).map((r: { mint: string }) => r.mint));
+
+    const { data: blockedCreatorsRows, error: bcErr } = await supabase
+      .from("blocked_creators")
+      .select("wallet")
+      .eq("is_active", true);
+    if (bcErr) throw bcErr;
+    const blockedCreators = new Set((blockedCreatorsRows ?? []).map((r: { wallet: string }) => r.wallet));
+
     // Latest trending snapshot
     const { data: snap, error: snapErr } = await supabase
       .from("trending_snapshots")
@@ -25,7 +40,7 @@ Deno.serve(async (_req) => {
     if (snap?.id) {
       const { data: items, error: itemsErr } = await supabase
         .from("trending_items")
-        .select("rank, mint, swap_count, fdv_usd")
+        .select("rank, mint, swap_count, fdv_usd, signal_touch_count, signal_points")
         .eq("snapshot_id", snap.id)
         .order("rank", { ascending: true });
       if (itemsErr) throw itemsErr;
@@ -49,14 +64,44 @@ Deno.serve(async (_req) => {
       .order("slot", { ascending: true });
     if (lErr) throw lErr;
 
+    // Collect mints from trending, watchlist, and launches (when mint not null)
+    const mintsToLookup = new Set<string>();
+    for (const t of trending) mintsToLookup.add(t.mint);
+    for (const w of watchlist ?? []) mintsToLookup.add(w.mint);
+    for (const l of launches ?? []) {
+      if (l.mint != null) mintsToLookup.add(l.mint);
+    }
+
+    // Fetch creator_wallet from token_cache for those mints
+    const mintToCreator = new Map<string, string | null>();
+    if (mintsToLookup.size > 0) {
+      const { data: cacheRows, error: cacheErr } = await supabase
+        .from("token_cache")
+        .select("mint, creator_wallet")
+        .in("mint", [...mintsToLookup]);
+      if (cacheErr) throw cacheErr;
+      for (const row of cacheRows ?? []) {
+        mintToCreator.set(row.mint, row.creator_wallet ?? null);
+      }
+    }
+
+    const isBlocked = (mint: string) =>
+      blockedMints.has(mint) || blockedCreators.has(mintToCreator.get(mint) ?? "");
+
+    const filteredTrending = trending.filter((t: { mint: string }) => !isBlocked(t.mint));
+    const filteredWatchlist = (watchlist ?? []).filter((w: { mint: string }) => !isBlocked(w.mint));
+    const filteredLaunches = (launches ?? []).filter((l: { mint?: string | null }) =>
+      l.mint == null ? true : !isBlocked(l.mint)
+    );
+
     return new Response(
       JSON.stringify({
         ok: true,
         day: today,
         snapshot: snap ?? null,
-        trending,
-        watchlist: watchlist ?? [],
-        launches: launches ?? [],
+        trending: filteredTrending,
+        watchlist: filteredWatchlist,
+        launches: filteredLaunches,
       }),
       { headers: { "Content-Type": "application/json" } },
     );

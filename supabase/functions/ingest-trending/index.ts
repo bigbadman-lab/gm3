@@ -10,10 +10,13 @@ const HELIUS_LIMIT = 100
 // wSOL mint on Solana mainnet – exclude from trending
 const WSOL_MINT = "So11111111111111111111111111111111111111112"
 
+const LAMPORTS_PER_SOL = 1e9
+
 type HeliusTx = {
   timestamp?: number
   feePayer?: string
   tokenTransfers?: Array<{ mint?: string; fromUserAccount?: string; toUserAccount?: string }>
+  nativeTransfers?: Array<{ fromUserAccount?: string; toUserAccount?: string; amount?: number }>
   events?: {
     swap?: {
       tokenInputs?: Array<{ mint?: string }>
@@ -70,6 +73,32 @@ function extractActorWalletFromTx(tx: HeliusTx): string | null {
     if (t.toUserAccount) return t.toUserAccount
   }
   return null
+}
+
+/** Classify tx as buy (actor received mint) or sell (actor sent mint). */
+function classifyBuySell(tx: HeliusTx, mint: string, actor: string): "buy" | "sell" | null {
+  const tt = tx.tokenTransfers ?? []
+  for (const t of tt) {
+    if (t.mint !== mint) continue
+    if (t.toUserAccount === actor) return "buy"
+    if (t.fromUserAccount === actor) return "sell"
+  }
+  return null
+}
+
+/** SOL amount transferred by actor in this tx: sent (buy) or received (sell). Lamports → SOL. */
+function getSolAmountForActor(
+  tx: HeliusTx,
+  actor: string,
+  direction: "buy" | "sell"
+): number {
+  const nt = tx.nativeTransfers ?? []
+  let lamports = 0
+  for (const n of nt) {
+    if (direction === "buy" && n.fromUserAccount === actor) lamports += Number(n.amount ?? 0)
+    if (direction === "sell" && n.toUserAccount === actor) lamports += Number(n.amount ?? 0)
+  }
+  return lamports / LAMPORTS_PER_SOL
 }
 
 Deno.serve(async (_req) => {
@@ -140,6 +169,11 @@ Deno.serve(async (_req) => {
     const swapCountByMint = new Map<string, number>()
     const signalTouchCountByMint = new Map<string, number>()
     const signalPointsByMint = new Map<string, number>()
+    const buyCountByMint = new Map<string, number>()
+    const sellCountByMint = new Map<string, number>()
+    const uniqueBuyersByMint = new Map<string, Set<string>>()
+    const buySolByMint = new Map<string, number>()
+    const sellSolByMint = new Map<string, number>()
     for (const tx of transactions) {
       if (!inWindow(tx)) continue
       const mint = extractMintFromTx(tx)
@@ -150,6 +184,20 @@ Deno.serve(async (_req) => {
         const weight = signalWalletToWeight.get(actorWallet) ?? 0
         signalTouchCountByMint.set(mint, (signalTouchCountByMint.get(mint) ?? 0) + 1)
         signalPointsByMint.set(mint, (signalPointsByMint.get(mint) ?? 0) + weight)
+      }
+      if (actorWallet) {
+        const side = classifyBuySell(tx, mint, actorWallet)
+        if (side === "buy") {
+          buyCountByMint.set(mint, (buyCountByMint.get(mint) ?? 0) + 1)
+          if (!uniqueBuyersByMint.has(mint)) uniqueBuyersByMint.set(mint, new Set())
+          uniqueBuyersByMint.get(mint)!.add(actorWallet)
+          const sol = getSolAmountForActor(tx, actorWallet, "buy")
+          buySolByMint.set(mint, (buySolByMint.get(mint) ?? 0) + sol)
+        } else if (side === "sell") {
+          sellCountByMint.set(mint, (sellCountByMint.get(mint) ?? 0) + 1)
+          const sol = getSolAmountForActor(tx, actorWallet, "sell")
+          sellSolByMint.set(mint, (sellSolByMint.get(mint) ?? 0) + sol)
+        }
       }
     }
 
@@ -176,15 +224,36 @@ Deno.serve(async (_req) => {
     const snapshotId = snapshot.id
 
     if (topMints.length > 0) {
-      const items = topMints.map(([mint, swap_count], i) => ({
-        snapshot_id: snapshotId,
-        rank: i + 1,
-        mint,
-        swap_count,
-        fdv_usd: null,
-        signal_touch_count: signalTouchCountByMint.get(mint) ?? 0,
-        signal_points: signalPointsByMint.get(mint) ?? 0,
-      }))
+      const items = topMints.map(([mint, swap_count], i) => {
+        const buy_count = Math.max(0, buyCountByMint.get(mint) ?? 0)
+        const sell_count = Math.max(0, sellCountByMint.get(mint) ?? 0)
+        const unique_buyers = Math.max(0, uniqueBuyersByMint.get(mint)?.size ?? 0)
+        const total_buy_sol = Math.max(0, buySolByMint.get(mint) ?? 0)
+        const total_sell_sol = Math.max(0, sellSolByMint.get(mint) ?? 0)
+        const net_sol_inflow = Math.max(0, total_buy_sol - total_sell_sol)
+        const total_swaps = buy_count + sell_count
+        const buy_ratio = total_swaps === 0 ? 0 : Math.min(1, Math.max(0, buy_count / total_swaps))
+        const is_qualified =
+          unique_buyers >= 20 &&
+          buy_ratio >= 0.65 &&
+          net_sol_inflow >= 3 &&
+          swap_count >= 25
+        return {
+          snapshot_id: snapshotId,
+          rank: i + 1,
+          mint,
+          swap_count,
+          fdv_usd: null,
+          signal_touch_count: signalTouchCountByMint.get(mint) ?? 0,
+          signal_points: signalPointsByMint.get(mint) ?? 0,
+          buy_count,
+          sell_count,
+          unique_buyers,
+          net_sol_inflow,
+          buy_ratio,
+          is_qualified,
+        }
+      })
       const { error: itemsError } = await supabase.from("trending_items").insert(items)
       if (itemsError) {
         return new Response(
