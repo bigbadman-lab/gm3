@@ -1,32 +1,69 @@
-// Follow this setup guide to integrate the Deno language server with your editor:
-// https://deno.land/manual/getting_started/setup_your_environment
-// This enables autocomplete, go to definition, etc.
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-// Setup type definitions for built-in Supabase Runtime APIs
-import "jsr:@supabase/functions-js/edge-runtime.d.ts"
+function utcDayString(d = new Date()) {
+  return d.toISOString().slice(0, 10); // YYYY-MM-DD UTC
+}
 
-console.log("Hello from Functions!")
+Deno.serve(async (_req) => {
+  try {
+    const url = Deno.env.get("SUPABASE_URL")!;
+    const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const supabase = createClient(url, serviceKey);
 
-Deno.serve(async (req) => {
-  const { name } = await req.json()
-  const data = {
-    message: `Hello ${name}!`,
+    const today = utcDayString();
+
+    // Latest trending snapshot
+    const { data: snap, error: snapErr } = await supabase
+      .from("trending_snapshots")
+      .select("id, window_seconds, window_end")
+      .order("window_end", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (snapErr) throw snapErr;
+
+    let trending: any[] = [];
+    if (snap?.id) {
+      const { data: items, error: itemsErr } = await supabase
+        .from("trending_items")
+        .select("rank, mint, swap_count, fdv_usd")
+        .eq("snapshot_id", snap.id)
+        .order("rank", { ascending: true });
+      if (itemsErr) throw itemsErr;
+      trending = items ?? [];
+    }
+
+    // Watchlist today
+    const { data: watchlist, error: wlErr } = await supabase
+      .from("watchlist_daily")
+      .select("mint, gm_count, fdv_usd")
+      .eq("day", today)
+      .order("gm_count", { ascending: false })
+      .limit(50);
+    if (wlErr) throw wlErr;
+
+    // Launches today (view)
+    const { data: launches, error: lErr } = await supabase
+      .from("launches_today")
+      .select("*")
+      .eq("day", today)
+      .order("slot", { ascending: true });
+    if (lErr) throw lErr;
+
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        day: today,
+        snapshot: snap ?? null,
+        trending,
+        watchlist: watchlist ?? [],
+        launches: launches ?? [],
+      }),
+      { headers: { "Content-Type": "application/json" } },
+    );
+  } catch (e) {
+    return new Response(
+      JSON.stringify({ ok: false, error: String(e) }),
+      { status: 500, headers: { "Content-Type": "application/json" } },
+    );
   }
-
-  return new Response(
-    JSON.stringify(data),
-    { headers: { "Content-Type": "application/json" } },
-  )
-})
-
-/* To invoke locally:
-
-  1. Run `supabase start` (see: https://supabase.com/docs/reference/cli/supabase-start)
-  2. Make an HTTP request:
-
-  curl -i --location --request POST 'http://127.0.0.1:54321/functions/v1/v1-today' \
-    --header 'Authorization: Bearer eyJhbGciOiJFUzI1NiIsImtpZCI6ImI4MTI2OWYxLTIxZDgtNGYyZS1iNzE5LWMyMjQwYTg0MGQ5MCIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjIwODUxMzIyMDJ9.2NjVZIIEUnm6KA0kO0pQJUCynOtZ02g7hZh7W1rJv3bS_rO-DtmPwt71M6R3wB5RcZC4-Pq87ns6yKqS2lCIfg' \
-    --header 'Content-Type: application/json' \
-    --data '{"name":"Functions"}'
-
-*/
+});
