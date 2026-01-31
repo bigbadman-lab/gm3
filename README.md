@@ -1,90 +1,130 @@
-# GM3 — Real-Time Token Discovery & Alerting Engine
+# GM3 — Real-Time Token Discovery & Alerts
 
-GM3 is a real-time Solana token discovery, qualification, and alerting system.  
-It ingests on-chain activity, detects early momentum, filters for quality, and surfaces high-signal tokens to users via API, web, iOS, and CLI.
+GM3 is a real-time Solana token discovery and alerting engine designed to surface **high-signal tokens early** — before they become obvious.
 
-GM3 is designed around **deterministic, explainable logic** rather than black-box ML, with clear lifecycle stages and tiered access (Free vs Pro).
+GM3 powers:
+- a web dashboard,
+- an iOS app,
+- and a terminal / CLI experience,
 
----
-
-## High-Level Architecture
-
-GM3 is composed of four main layers:
-
-1. **Ingestion (Discovery)**
-   - Fetches on-chain transactions from Helius
-   - Aggregates activity per mint in short time windows
-   - Identifies trending tokens
-
-2. **Qualification & Alert Logic**
-   - Applies explicit qualification thresholds
-   - Applies capital efficiency + market structure checks
-   - Determines whether a token is “alertworthy”
-
-3. **ATH Tracking**
-   - Promotes alertworthy mints into an ATH tracking pipeline
-   - Polls FDV via Birdeye
-   - Tracks current FDV and all-time highs over time
-
-4. **Read API**
-   - Serves data to web, iOS, and CLI clients
-   - Applies blocklists and sorting
-   - Enforces tiered access (Free vs Pro)
+all backed by the same real-time data engine.
 
 ---
 
-## Core Tables
+## What GM3 Does
 
-| Table | Purpose |
-|------|--------|
-| `trending_snapshots` | One row per ingestion window (e.g. 10 min). |
-| `trending_items` | Per-snapshot metrics per mint (swaps, buyers, inflow, etc.). |
-| `trending_items_latest` | View: latest row per mint. |
-| `mint_entries` | Mints promoted for ATH tracking. |
-| `token_ath` | Current FDV, ATH FDV, polling schedule per mint. |
-| `blocked_mints` | Explicitly blocked token mints. |
-| `blocked_creators` | Blocked creator wallets. |
-| `watchlist_daily` | Manual GM3 watchlist entries. |
+GM3 continuously analyzes on-chain activity to:
+- detect early momentum,
+- filter out low-quality or manipulated tokens,
+- and surface tokens that meet strict quality and efficiency criteria.
+
+The goal is not “what’s loudest”, but **what’s worth paying attention to**.
 
 ---
 
-## End-to-End Token Lifecycle
+## How GM3 Works (High Level)
 
-### 1. Mint Discovery (Helius)
-- GM3 fetches recent transactions from Helius for a monitored program.
-- Transactions are filtered to a fixed time window.
-- Each transaction is parsed to extract:
-  - mint
-  - buy/sell classification
-  - SOL amount
-  - actor wallet
+GM3 runs a live pipeline with four stages:
 
-### 2. Aggregation & Trending Selection
-For each mint in the window, GM3 aggregates:
-- swap_count
-- buy_count / sell_count
-- unique_buyers
-- net_sol_inflow
-- signal wallet touches
+### 1. Discovery
+GM3 monitors on-chain activity in short rolling windows and identifies tokens with unusual, sustained activity.
 
-Only the **top N mints by swap_count** (currently 20) are kept per window.
+### 2. Qualification
+Discovered tokens must pass multiple checks, including:
+- real participation (not just bots),
+- strong buy pressure,
+- meaningful capital inflow,
+- and sufficient liquidity.
+
+Only tokens that meet these criteria are considered **qualified**.
+
+### 3. Alerting
+Qualified tokens are further evaluated for:
+- capital efficiency,
+- healthy market structure,
+- and sustainable inflow patterns.
+
+Tokens that pass are marked **alertworthy** and prioritized across GM3 surfaces.
+
+### 4. Tracking
+Alertworthy tokens are tracked in real time:
+- current valuation
+- all-time highs
+- momentum over time
 
 ---
 
-## Qualification Logic (Explicit)
+## What Makes GM3 Different
 
-A mint is marked **qualified** if **all** of the following are true:
+### Signal > Noise
+GM3 does not rank tokens purely by volume or hype.  
+Every surfaced token has passed deterministic, explainable checks.
 
-- `unique_buyers >= 20`
-- `buy_ratio >= 0.65`
-- `net_sol_inflow >= 3` SOL
-- `swap_count >= 25`
+### Early, Not Late
+GM3 is designed to detect *emerging* activity — not tokens that already peaked.
 
-This logic is applied at insert time when writing to `trending_items`.
+### Explainable by Design
+There is no black-box scoring.  
+Signals are derived from observable on-chain behavior and capital flow.
 
-```text
-qualified =
-  unique_buyers >= 20 AND
-  buy_ratio >= 0.65 AND
-  net_sol_inflow >= 3 AND
-  swap_count >= 25
+### Real-Time Infrastructure
+The same real-time backend powers:
+- the website,
+- the iOS app,
+- and the CLI.
+
+---
+
+## Free vs Pro Access
+
+### Free
+- Delayed data
+- Curated selection of qualified tokens
+- Limited refresh rate
+
+### Pro
+- Real-time data
+- Early alerts on high-signal tokens
+- Full access across web, iOS, and CLI
+- Faster refresh and deeper tracking
+
+Upgrading to Pro unlocks **speed and completeness**, not just more data.
+
+---
+
+## Supported Platforms
+
+- 🌐 Web dashboard
+- 📱 iOS app
+- 💻 Terminal / CLI
+
+Your account works seamlessly across all platforms.
+
+---
+
+## Built for Reliability
+
+GM3 is engineered with:
+- deterministic logic (no guesswork),
+- idempotent updates,
+- strict lifecycle rules,
+- and automatic archiving.
+
+Historical data is never rewritten, and signals are never retroactively altered.
+
+---
+
+## Vision
+
+GM3 exists to answer one question:
+
+> **“What is starting to matter — and why?”**
+
+Not later.  
+Not after everyone sees it.  
+Early, explainable, and actionable.
+
+---
+
+GM3 is under active development.  
+New signals, alerts, and Pro features are added continuously.
