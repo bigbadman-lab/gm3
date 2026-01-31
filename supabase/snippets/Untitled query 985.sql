@@ -1,4 +1,4 @@
-select
+=select
   mint,
   entry_ts,
   current_fdv_usd,
@@ -10,3 +10,4 @@ select
   status
 from public.token_ath
 where mint = '3GwyDM2wm2CtoLD7Mfrg9T7ipExXGhnbDNW8xNAH5uKw';
+

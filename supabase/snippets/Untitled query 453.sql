@@ -1,0 +1,4 @@
+select vault.create_secret(
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InN1cW9wd2ZlenVtaHZteXZzZ2pvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk3MTc1MjQsImV4cCI6MjA4NTI5MzUyNH0.SOvbjqcmBEug6NHXnY_XSzTgcCjV5As_aAEF3_zm5jk',
+  'anon_key'
+);
