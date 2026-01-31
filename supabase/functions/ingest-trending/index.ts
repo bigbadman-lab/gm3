@@ -140,8 +140,37 @@ async function fetchBirdeyeOverview(mint: string): Promise<{
   }
 }
 
-Deno.serve(async (_req) => {
+function normalizeError(e: unknown): { message?: string; name?: string; stack?: string; details?: string } {
+  if (typeof e === "string") return { message: e }
+  if (e instanceof Error) return { name: e.name, message: e.message, stack: e.stack }
+  if (e && typeof e === "object") {
+    const anyE = e as Record<string, unknown>
+    const message = (anyE.message ?? anyE.error_description ?? anyE.error) as string | undefined
+    const details = (anyE.details ?? anyE.hint ?? anyE.code) as string | undefined
+    try {
+      return { message: message ?? JSON.stringify(anyE), details }
+    } catch {
+      return { message: String(anyE), details }
+    }
+  }
+  return { message: String(e) }
+}
+
+Deno.serve(async (req) => {
   try {
+    // Bearer token auth (no Supabase JWT). Set verify_jwt = false for this function so cron can call with header.
+    const expected = Deno.env.get("INGEST_TRENDING_TOKEN") ?? ""
+    const auth = (req.headers.get("authorization") ?? "").trim()
+    const xcron = (req.headers.get("x-cron-token") ?? "").trim()
+    const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : ""
+    const provided = bearer || xcron
+    if (!expected || provided !== expected) {
+      return new Response(JSON.stringify({ ok: false, error: normalizeError("unauthorized") }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      })
+    }
+
     const supabaseUrl = Deno.env.get("SUPABASE_URL")
     const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")
     const heliusApiKey = Deno.env.get("HELIUS_API_KEY")
@@ -151,7 +180,7 @@ Deno.serve(async (_req) => {
       return new Response(
         JSON.stringify({
           ok: false,
-          error: "Missing env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, HELIUS_API_KEY, or PUMPFUN_ADDRESS",
+          error: normalizeError("Missing env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, HELIUS_API_KEY, or PUMPFUN_ADDRESS"),
         }),
         { status: 500, headers: { "Content-Type": "application/json" } },
       )
@@ -169,11 +198,13 @@ Deno.serve(async (_req) => {
       signalWalletToWeight.set(row.wallet, Number(row.weight) ?? 0)
     }
 
-    const now = Date.now()
-    const windowEnd = new Date(now)
-    const windowStart = new Date(now - WINDOW_SECONDS * 1000)
-    const windowStartSec = Math.floor(windowStart.getTime() / 1000)
-    const windowEndSec = Math.floor(windowEnd.getTime() / 1000)
+    // Deterministic rolling window: end rounded down to nearest minute, start = end - WINDOW_SECONDS
+    const windowEndMs = Math.floor(Date.now() / 60000) * 60000
+    const windowStartMs = windowEndMs - WINDOW_SECONDS * 1000
+    const windowStartSec = Math.floor(windowStartMs / 1000)
+    const windowEndSec = Math.floor(windowEndMs / 1000)
+    const windowEnd = new Date(windowEndMs)
+    const windowStart = new Date(windowStartMs)
 
     const heliusBaseUrl =
       `https://api-mainnet.helius-rpc.com/v0/addresses/${encodeURIComponent(pumpfunAddress)}/transactions?api-key=${encodeURIComponent(heliusApiKey)}&limit=${HELIUS_PAGE_LIMIT}`
@@ -303,15 +334,19 @@ Deno.serve(async (_req) => {
     const windowEndIso = windowEnd.toISOString()
     const windowStartIso = windowStart.toISOString()
 
+    // Idempotent: upsert on (window_seconds, window_end) so we always get snapshot_id for this window
     const { data: snapshot, error: snapError } = await supabase
       .from("trending_snapshots")
-      .insert({ window_seconds: WINDOW_SECONDS, window_end: windowEndIso })
+      .upsert(
+        { window_seconds: WINDOW_SECONDS, window_end: windowEndIso },
+        { onConflict: "window_seconds,window_end" }
+      )
       .select("id")
       .single()
 
     if (snapError) {
       return new Response(
-        JSON.stringify({ ok: false, error: snapError.message }),
+        JSON.stringify({ ok: false, error: normalizeError(snapError) }),
         { status: 500, headers: { "Content-Type": "application/json" } },
       )
     }
@@ -352,7 +387,7 @@ Deno.serve(async (_req) => {
       const { error: itemsError } = await supabase.from("trending_items").insert(items)
       if (itemsError) {
         return new Response(
-          JSON.stringify({ ok: false, error: itemsError.message }),
+          JSON.stringify({ ok: false, error: normalizeError(itemsError) }),
           { status: 500, headers: { "Content-Type": "application/json" } },
         )
       }
@@ -426,12 +461,10 @@ Deno.serve(async (_req) => {
       }),
       { headers: { "Content-Type": "application/json" } },
     )
-  } catch (e) {
+  } catch (err) {
+    console.error("ingest-trending failed", err)
     return new Response(
-      JSON.stringify({
-        ok: false,
-        error: e instanceof Error ? e.message : String(e),
-      }),
+      JSON.stringify({ ok: false, error: normalizeError(err) }),
       { status: 500, headers: { "Content-Type": "application/json" } },
     )
   }
