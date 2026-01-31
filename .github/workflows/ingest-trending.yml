@@ -1,0 +1,19 @@
+name: ingest-trending
+
+on:
+  schedule:
+    - cron: "* * * * *"
+  workflow_dispatch:
+
+jobs:
+  call-ingest-trending:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call ingest-trending Edge Function
+        run: |
+          resp=$(curl -sf -X POST \
+            -H "Content-Type: application/json" \
+            -H "x-cron-token: ${{ secrets.INGEST_TRENDING_TOKEN }}" \
+            -d '{}' \
+            "https://suqopwfezumhvmyvsgjo.supabase.co/functions/v1/ingest-trending")
+          echo "$resp"
