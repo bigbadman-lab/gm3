@@ -101,6 +101,43 @@ function getSolAmountForActor(
   return lamports / LAMPORTS_PER_SOL
 }
 
+/** Birdeye token overview: price, supply, FDV, last trade time. Returns null on API error or missing data. */
+async function fetchBirdeyeOverview(mint: string): Promise<{
+  priceUsd: number
+  totalSupply: number
+  fdvUsd: number
+  lastTradeUnixTime: number
+} | null> {
+  const apiKey = Deno.env.get("BIRDEYE_API_KEY")
+  if (!apiKey) return null
+  const url = `https://public-api.birdeye.so/defi/token_overview?address=${encodeURIComponent(mint)}`
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "X-API-KEY": apiKey,
+        "x-chain": "solana",
+      },
+    })
+    if (!res.ok) return null
+    const body = await res.json() as { success?: boolean; data?: { price?: number; totalSupply?: number; fdv?: number; lastTradeUnixTime?: number } }
+    if (body?.success !== true || body?.data == null) return null
+    const d = body.data
+    const priceUsd = d.price
+    const totalSupply = d.totalSupply
+    const fdvUsd = d.fdv
+    const lastTradeUnixTime = d.lastTradeUnixTime
+    if (
+      typeof priceUsd !== "number" ||
+      typeof totalSupply !== "number" ||
+      typeof fdvUsd !== "number" ||
+      typeof lastTradeUnixTime !== "number"
+    ) return null
+    return { priceUsd, totalSupply, fdvUsd, lastTradeUnixTime }
+  } catch {
+    return null
+  }
+}
+
 Deno.serve(async (_req) => {
   try {
     const supabaseUrl = Deno.env.get("SUPABASE_URL")
@@ -118,7 +155,7 @@ Deno.serve(async (_req) => {
       )
     }
 
-    const supabase = createClient(supabaseUrl, serviceKey)
+    const supabase = createClient(supabaseUrl, serviceKey) // service role (not anon)
 
     const { data: signalRows, error: sigErr } = await supabase
       .from("signal_wallets")
@@ -262,6 +299,55 @@ Deno.serve(async (_req) => {
         )
       }
     }
+
+    let updatedCount = 0
+    try {
+      // FDV enrichment: fill price_usd, total_supply, fdv_usd for candidates (right before response)
+      const enrichEnabled = (Deno.env.get("FDV_ENRICH_ENABLED") ?? "true") !== "false"
+      const requireQualified = (Deno.env.get("FDV_REQUIRE_QUALIFIED") ?? "true") !== "false"
+      const birdeyeKey = Deno.env.get("BIRDEYE_API_KEY") ?? ""
+      if (enrichEnabled && birdeyeKey) {
+        let candidatesQuery = supabase
+          .from("trending_items")
+          .select("mint")
+          .or("fdv_usd.is.null,price_usd.is.null,total_supply.is.null")
+        if (requireQualified) {
+          candidatesQuery = candidatesQuery.eq("is_qualified", true)
+        }
+        const { data: candidates, error: candidatesErr } = await candidatesQuery
+          .order("swap_count", { ascending: false })
+          .limit(10)
+        if (!candidatesErr && candidates?.length) {
+          for (const row of candidates) {
+            const mint = row.mint
+            const url = `https://public-api.birdeye.so/defi/token_overview?address=${encodeURIComponent(mint)}`
+            const res = await fetch(url, {
+              headers: { "X-API-KEY": birdeyeKey, "x-chain": "solana" },
+            })
+            if (!res.ok) continue
+            const body = await res.json() as { success?: boolean; data?: { price?: number; totalSupply?: number; fdv?: number } }
+            if (body?.success !== true || !body?.data) continue
+            const d = body.data
+            const price_usd = d.price
+            const total_supply = d.totalSupply
+            const fdv_usd = d.fdv ?? (typeof d.price === "number" && typeof d.totalSupply === "number" ? d.price * d.totalSupply : undefined)
+            if (
+              typeof price_usd !== "number" || !Number.isFinite(price_usd) ||
+              typeof total_supply !== "number" || !Number.isFinite(total_supply) ||
+              typeof fdv_usd !== "number" || !Number.isFinite(fdv_usd)
+            ) continue
+            const { error: updateErr } = await supabase
+              .from("trending_items")
+              .update({ price_usd, total_supply, fdv_usd, updated_at: new Date().toISOString() })
+              .eq("mint", mint)
+            if (!updateErr) updatedCount++
+          }
+        }
+      }
+    } catch (e) {
+      // enrichment error: continue to response
+    }
+    console.log("[FDV] enriched", updatedCount, "tokens");
 
     const top = topMints.map(([mint, swap_count], i) => ({
       rank: i + 1,

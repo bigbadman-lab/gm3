@@ -1,7 +1,3 @@
 select mint, price_usd, total_supply, fdv_usd, updated_at
 from trending_items
 where mint = 'AosshFjcGwH7NXn58VhgvoVdfXsa8BqzyDoZAQWdpump';
-select id, created_at
-from trending_snapshots
-order by created_at desc
-limit 3;

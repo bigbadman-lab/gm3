@@ -1,3 +1,6 @@
+select mint, price_usd, total_supply, fdv_usd, updated_at
+from trending_items
+where mint = 'AosshFjcGwH7NXn58VhgvoVdfXsa8BqzyDoZAQWdpump';
 select
   count(*) as total_mints,
   sum(case when coalesce(signal_touch_count,0) > 0 then 1 else 0 end) as mints_with_signal,
