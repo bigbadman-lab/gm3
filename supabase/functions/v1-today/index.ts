@@ -36,16 +36,16 @@ Deno.serve(async (_req) => {
       .maybeSingle();
     if (snapErr) throw snapErr;
 
-    let trending: any[] = [];
-    if (snap?.id) {
-      const { data: items, error: itemsErr } = await supabase
-        .from("trending_items")
-        .select("rank, mint, swap_count, fdv_usd, signal_touch_count, signal_points")
-        .eq("snapshot_id", snap.id)
-        .order("rank", { ascending: true });
-      if (itemsErr) throw itemsErr;
-      trending = items ?? [];
-    }
+    // Latest row per mint (by updated_at), with new inflow/alert fields; sort by alert + score + inflow + time
+    const { data: items, error: itemsErr } = await supabase
+      .from("trending_items_latest")
+      .select("rank, mint, swap_count, fdv_usd, signal_touch_count, signal_points, net_sol_inflow, inflow_band_ok, inflow_band_reason, inflow_score, is_alertworthy, mc_floor_ok, mc_floor_reason, capital_efficiency, mc_structure_ok, mc_structure_reason, updated_at")
+      .order("is_alertworthy", { ascending: false })
+      .order("inflow_score", { ascending: false })
+      .order("net_sol_inflow", { ascending: false })
+      .order("updated_at", { ascending: false });
+    if (itemsErr) throw itemsErr;
+    const trending: any[] = items ?? [];
 
     // Watchlist today
     const { data: watchlist, error: wlErr } = await supabase

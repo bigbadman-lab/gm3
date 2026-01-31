@@ -5,7 +5,8 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
 const WINDOW_SECONDS = 600
 const HELIUS_FETCH_TIMEOUT_MS = 15_000
 const TOP_N = 20
-const HELIUS_LIMIT = 100
+const HELIUS_PAGE_LIMIT = 100
+const HELIUS_MAX_TX = 2000
 
 // wSOL mint on Solana mainnet – exclude from trending
 const WSOL_MINT = "So11111111111111111111111111111111111111112"
@@ -13,6 +14,7 @@ const WSOL_MINT = "So11111111111111111111111111111111111111112"
 const LAMPORTS_PER_SOL = 1e9
 
 type HeliusTx = {
+  signature?: string
   timestamp?: number
   feePayer?: string
   tokenTransfers?: Array<{ mint?: string; fromUserAccount?: string; toUserAccount?: string }>
@@ -173,29 +175,85 @@ Deno.serve(async (_req) => {
     const windowStartSec = Math.floor(windowStart.getTime() / 1000)
     const windowEndSec = Math.floor(windowEnd.getTime() / 1000)
 
-    const heliusUrl =
-      `https://api-mainnet.helius-rpc.com/v0/addresses/${encodeURIComponent(pumpfunAddress)}/transactions?api-key=${encodeURIComponent(heliusApiKey)}&limit=${HELIUS_LIMIT}`
+    const heliusBaseUrl =
+      `https://api-mainnet.helius-rpc.com/v0/addresses/${encodeURIComponent(pumpfunAddress)}/transactions?api-key=${encodeURIComponent(heliusApiKey)}&limit=${HELIUS_PAGE_LIMIT}`
 
-    const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), HELIUS_FETCH_TIMEOUT_MS)
+    const transactions: HeliusTx[] = []
+    let beforeSignature: string | undefined = undefined
+    let pageNum = 0
+    let stopReason: "covered window" | "cap reached" | "no more pages" | "paging stuck" | null = null
+    let firstSigPage1: string | undefined = undefined
 
-    let transactions: HeliusTx[] = []
-    try {
-      const res = await fetch(heliusUrl, { signal: controller.signal })
-      clearTimeout(timeoutId)
-      if (!res.ok) {
-        throw new Error(`Helius HTTP ${res.status}: ${await res.text()}`)
-      }
-      const data = await res.json()
-      transactions = Array.isArray(data) ? data : []
-    } catch (e) {
-      clearTimeout(timeoutId)
-      if (e instanceof Error) {
-        if (e.name === "AbortError") throw new Error("Helius fetch timeout")
+    while (true) {
+      pageNum += 1
+      const pageUrl = beforeSignature
+        ? `${heliusBaseUrl}&before=${encodeURIComponent(beforeSignature)}`
+        : heliusBaseUrl
+
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), HELIUS_FETCH_TIMEOUT_MS)
+      let page: HeliusTx[]
+      try {
+        const res = await fetch(pageUrl, { signal: controller.signal })
+        clearTimeout(timeoutId)
+        if (!res.ok) {
+          throw new Error(`Helius HTTP ${res.status}: ${await res.text()}`)
+        }
+        const data = await res.json()
+        page = Array.isArray(data) ? data : []
+      } catch (e) {
+        clearTimeout(timeoutId)
+        if (e instanceof Error) {
+          if (e.name === "AbortError") throw new Error("Helius fetch timeout")
+          throw e
+        }
         throw e
       }
-      throw e
+
+      if (page.length === 0) {
+        stopReason = "no more pages"
+        console.log("[HELIUS] page", pageNum, "size=0 total=" + transactions.length, "stop=no more pages")
+        break
+      }
+
+      transactions.push(...page)
+      const firstInPage = page[0]
+      const firstSig = firstInPage?.signature ?? (firstInPage as { transactionSignature?: string }).transactionSignature
+      if (pageNum === 1) {
+        firstSigPage1 = firstSig
+      } else if (pageNum === 2 && firstSig != null && firstSig === firstSigPage1) {
+        console.log("[HELIUS] paging appears stuck (page 2 same as page 1)")
+        stopReason = "paging stuck"
+        break
+      }
+      const lastInPage = page[page.length - 1]
+      const oldestInPage = lastInPage?.timestamp
+      const cursor = lastInPage?.signature ?? (lastInPage as { transactionSignature?: string }).transactionSignature
+      beforeSignature = cursor ?? undefined
+
+      console.log(
+        "[HELIUS] page", pageNum,
+        "size=" + page.length,
+        "total=" + transactions.length,
+        "oldest_ts=" + (oldestInPage ?? "?"),
+        "before=" + (beforeSignature ?? "none")
+      )
+
+      if (transactions.length >= HELIUS_MAX_TX) {
+        stopReason = "cap reached"
+        break
+      }
+      if (oldestInPage != null && oldestInPage < windowStartSec) {
+        stopReason = "covered window"
+        break
+      }
+      if (!beforeSignature) {
+        stopReason = "no more pages"
+        break
+      }
     }
+
+    console.log("[HELIUS] final total=" + transactions.length, "stop_reason=" + (stopReason ?? "unknown"))
 
     const inWindow = (tx: HeliusTx) => {
       const ts = tx.timestamp
