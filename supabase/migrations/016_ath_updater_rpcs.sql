@@ -1,4 +1,26 @@
 -- RPCs for ath-updater Edge Function: locked select of due mints + single-row update with next_check_ts/archive.
+-- Self-contained: create referenced tables if missing so migration runs even if earlier migrations weren't applied.
+
+-- Tables referenced by get_due_ath_mints and update_ath_for_mint
+create table if not exists public.token_ath (
+  mint text not null primary key,
+  status text not null default 'active',
+  next_check_ts timestamptz,
+  current_fdv_usd numeric,
+  current_ts timestamptz,
+  ath_fdv_usd numeric,
+  ath_ts timestamptz,
+  last_checked_ts timestamptz,
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists idx_token_ath_status_next_check_ts
+  on public.token_ath (status, next_check_ts);
+
+create table if not exists public.mint_entries (
+  mint text not null primary key,
+  entry_ts timestamptz not null
+);
 
 -- Returns up to lim due mints (status=active, next_check_ts <= now()) with entry_ts for compute_next_check_ts.
 -- FOR UPDATE SKIP LOCKED so concurrent runs don't process the same rows.

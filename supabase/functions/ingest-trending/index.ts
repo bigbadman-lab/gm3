@@ -4,13 +4,15 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
 
 const WINDOW_SECONDS = 600
 const HELIUS_FETCH_TIMEOUT_MS = 15_000
-const TOP_N = 20
 const MAX_WINDOWS_PER_RUN = 5
-const MAX_LAG_MINUTES = 15
+const MAX_QUALIFIED_PER_WINDOW = 200
 const HELIUS_PAGE_LIMIT = 100
-const HELIUS_MAX_TX = 2000
-const MAX_PAGES_PER_WINDOW = 3
-const MAX_TX_PER_WINDOW = 1000
+const PAGE_TIMEOUT_MS = 8000
+const INGEST_STATE_NAME = "ingest-trending"
+const BOOTSTRAP_MAX_PAGES = 3
+const MAX_PAGES_PER_RUN = 50
+const MAX_TXS_PER_RUN = 5000
+const INGEST_TRENDING_BUILD = "cursor-v1-2026-02-01"
 
 // wSOL mint on Solana mainnet – exclude from trending
 const WSOL_MINT = "So11111111111111111111111111111111111111112"
@@ -188,6 +190,13 @@ function getTxTimeSec(tx: unknown): number | null {
   )
 }
 
+function getTxSignature(tx: unknown): string | null {
+  if (tx == null || typeof tx !== "object") return null
+  const t = tx as Record<string, unknown>
+  const sig = t.signature ?? (t as { transactionSignature?: string }).transactionSignature
+  return typeof sig === "string" && sig.length > 0 ? sig : null
+}
+
 /** fetch with hard timeout via AbortController. */
 async function fetchWithTimeout(
   url: string,
@@ -209,110 +218,23 @@ async function fetchWithTimeout(
   }
 }
 
-/** Ingest one deterministic window. All time derived from windowEndMs; no use of "now". */
-async function ingestOneWindow(
+/** Aggregate txs for one window and upsert snapshot + items. Txs are pre-bucketed; filter by window. */
+async function aggregateAndUpsertWindow(
   supabase: ReturnType<typeof createClient>,
   windowEndMs: number,
-  signalWalletToWeight: Map<string, number>,
-  heliusBaseUrl: string
-): Promise<{ snapshot_id: string; items_inserted: number; window_end: string }> {
-  const windowStartMs = windowEndMs - WINDOW_SECONDS * 1000
-  const windowStartSec = Math.floor(windowStartMs / 1000)
+  txs: HeliusTx[],
+  signalWalletToWeight: Map<string, number>
+): Promise<{ snapshot_id: string; items_inserted: number; window_end: string; mints_extracted: number; qualified_count: number }> {
   const windowEndSec = Math.floor(windowEndMs / 1000)
-  const windowEnd = new Date(windowEndMs)
-  const windowStart = new Date(windowStartMs)
-  const windowEndIso = windowEnd.toISOString()
-  const windowStartIso = windowStart.toISOString()
-
-  const transactions: HeliusTx[] = []
-  let beforeSignature: string | undefined = undefined
-  let pageNum = 0
-  let stopReason: "covered window" | "cap reached" | "no more pages" | "paging stuck" | null = null
-  let firstSigPage1: string | undefined = undefined
-
-  while (true) {
-    pageNum += 1
-    const pageUrl = beforeSignature
-      ? `${heliusBaseUrl}&before=${encodeURIComponent(beforeSignature)}`
-      : heliusBaseUrl
-
-    let page: HeliusTx[]
-    try {
-      const res = await fetchWithTimeout(pageUrl, undefined, 10000)
-      if (!res.ok) {
-        throw new Error(`Helius HTTP ${res.status}: ${await res.text()}`)
-      }
-      const data = await res.json()
-      page = Array.isArray(data) ? data : []
-    } catch (e) {
-      if (e instanceof Error && e.message === "fetch timeout") {
-        throw new Error(`Helius fetch timeout window_end=${windowEndIso} page=${pageNum}`)
-      }
-      throw e
-    }
-
-    if (page.length === 0) {
-      stopReason = "no more pages"
-      break
-    }
-
-    transactions.push(...page)
-    const pageTsValues = page.map((tx) => getTxTimeSec(tx)).filter((t): t is number => t != null)
-    const pageMinTs = pageTsValues.length > 0 ? Math.min(...pageTsValues) : null
-    const pageMaxTs = pageTsValues.length > 0 ? Math.max(...pageTsValues) : null
-    if (pageMinTs != null && pageMinTs < windowStartSec) {
-      console.log("[helius] early stop", { window_end: windowEndIso, pageNum, pageMinTs, pageMaxTs, windowStartSec, windowEndSec })
-      stopReason = "covered window"
-      break
-    }
-    if (pageMaxTs != null && pageMaxTs < windowStartSec) {
-      console.log("[helius] early stop", { window_end: windowEndIso, pageNum, pageMinTs, pageMaxTs, windowStartSec, windowEndSec })
-      stopReason = "covered window"
-      break
-    }
-    const firstInPage = page[0]
-    const lastInPage = page[page.length - 1]
-    const firstSig = firstInPage?.signature ?? (firstInPage as { transactionSignature?: string }).transactionSignature
-    const lastSig = lastInPage?.signature ?? (lastInPage as { transactionSignature?: string }).transactionSignature
-    const firstTs = getTxTimeSec(firstInPage) ?? null
-    const lastTs = getTxTimeSec(lastInPage) ?? null
-    console.log("[helius] page", { window_end: windowEndIso, pageNum, firstTs, lastTs, firstSig, lastSig })
-    if (!lastSig || lastSig === beforeSignature) {
-      console.log("[helius] pagination stuck")
-      stopReason = "paging stuck"
-      break
-    }
-    beforeSignature = lastSig
-
-    if (transactions.length >= MAX_TX_PER_WINDOW) {
-      stopReason = "cap reached"
-      break
-    }
-    if (pageNum >= MAX_PAGES_PER_WINDOW) {
-      stopReason = "cap reached"
-      break
-    }
-    if (!beforeSignature) {
-      stopReason = "no more pages"
-      break
-    }
-  }
-
-  const tsValues = transactions.map((tx) => getTxTimeSec(tx)).filter((t): t is number => t != null)
-  const minTs = tsValues.length > 0 ? Math.min(...tsValues) : undefined
-  const maxTs = tsValues.length > 0 ? Math.max(...tsValues) : undefined
-  console.log("[helius] page time range", { window_end: windowEndIso, minTs, maxTs, windowStartSec, windowEndSec, pages: pageNum, txs_total: transactions.length })
-
-  console.log("[diag] txs total", { window_end: windowEndIso, txs_total: transactions.length })
+  const windowStartSec = windowEndSec - WINDOW_SECONDS
+  const windowEndIso = new Date(windowEndMs).toISOString()
 
   const inWindow = (tx: HeliusTx) => {
     const t = getTxTimeSec(tx)
     if (t == null) return false
     return windowStartSec <= t && t < windowEndSec
   }
-  const filteredTxs = transactions.filter(inWindow)
-  const inWindowCount = filteredTxs.length
-  console.log("[diag] txs in window", { window_end: windowEndIso, in_window: inWindowCount, windowStartSec, windowEndSec })
+  const filteredTxs = txs.filter(inWindow)
 
   const swapCountByMint = new Map<string, number>()
   const signalTouchCountByMint = new Map<string, number>()
@@ -348,12 +270,6 @@ async function ingestOneWindow(
     }
   }
 
-  console.log("[diag] mints aggregated", { window_end: windowEndIso, mints: swapCountByMint.size })
-
-  const topMints = [...swapCountByMint.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, TOP_N)
-
   const { data: snapshot, error: snapError } = await supabase
     .from("trending_snapshots")
     .upsert(
@@ -366,50 +282,69 @@ async function ingestOneWindow(
   if (snapError) throw snapError
   const snapshotId = snapshot.id
 
-  let itemsInserted = 0
-  if (topMints.length > 0) {
-    console.log("[diag] items to insert", { window_end: windowEndIso, items: topMints.length })
-    const items = topMints.map(([mint, swap_count], i) => {
-      const buy_count = Math.max(0, buyCountByMint.get(mint) ?? 0)
-      const sell_count = Math.max(0, sellCountByMint.get(mint) ?? 0)
-      const unique_buyers = Math.max(0, uniqueBuyersByMint.get(mint)?.size ?? 0)
-      const total_buy_sol = Math.max(0, buySolByMint.get(mint) ?? 0)
-      const total_sell_sol = Math.max(0, sellSolByMint.get(mint) ?? 0)
-      const net_sol_inflow = Math.max(0, total_buy_sol - total_sell_sol)
-      const total_swaps = buy_count + sell_count
-      const buy_ratio = total_swaps === 0 ? 0 : Math.min(1, Math.max(0, buy_count / total_swaps))
-      const is_qualified =
-        unique_buyers >= 20 &&
-        buy_ratio >= 0.65 &&
-        net_sol_inflow >= 3 &&
-        swap_count >= 25
-      return {
-        snapshot_id: snapshotId,
-        rank: i + 1,
-        mint,
-        swap_count,
-        fdv_usd: null,
-        signal_touch_count: signalTouchCountByMint.get(mint) ?? 0,
-        signal_points: signalPointsByMint.get(mint) ?? 0,
-        buy_count,
-        sell_count,
-        unique_buyers,
-        net_sol_inflow,
-        buy_ratio,
-        is_qualified,
-      }
-    })
-    const { error: itemsError } = await supabase.from("trending_items").insert(items)
-    if (itemsError) throw itemsError
-    itemsInserted = topMints.length
+  const qualifiedCandidates: Array<{ mint: string; swap_count: number; buy_count: number; sell_count: number; unique_buyers: number; net_sol_inflow: number; buy_ratio: number; is_qualified: true }> = []
+  for (const [mint, swap_count] of swapCountByMint.entries()) {
+    const buy_count = Math.max(0, buyCountByMint.get(mint) ?? 0)
+    const sell_count = Math.max(0, sellCountByMint.get(mint) ?? 0)
+    const unique_buyers = Math.max(0, uniqueBuyersByMint.get(mint)?.size ?? 0)
+    const total_buy_sol = Math.max(0, buySolByMint.get(mint) ?? 0)
+    const total_sell_sol = Math.max(0, sellSolByMint.get(mint) ?? 0)
+    const net_sol_inflow = Math.max(0, total_buy_sol - total_sell_sol)
+    const total_swaps = buy_count + sell_count
+    const buy_ratio = total_swaps === 0 ? 0 : Math.min(1, Math.max(0, buy_count / total_swaps))
+    const is_qualified =
+      unique_buyers >= 20 &&
+      buy_ratio >= 0.65 &&
+      net_sol_inflow >= 3 &&
+      swap_count >= 25
+    if (is_qualified) {
+      qualifiedCandidates.push({ mint, swap_count, buy_count, sell_count, unique_buyers, net_sol_inflow, buy_ratio, is_qualified: true })
+    }
   }
 
-  return { snapshot_id: snapshotId, items_inserted: itemsInserted, window_end: windowEndIso }
+  const sorted = qualifiedCandidates
+    .sort((a, b) => {
+      if (b.net_sol_inflow !== a.net_sol_inflow) return b.net_sol_inflow - a.net_sol_inflow
+      if (b.swap_count !== a.swap_count) return b.swap_count - a.swap_count
+      return b.unique_buyers - a.unique_buyers
+    })
+    .slice(0, MAX_QUALIFIED_PER_WINDOW)
+
+  const items = sorted.map((c, i) => ({
+    snapshot_id: snapshotId,
+    rank: i + 1,
+    mint: c.mint,
+    swap_count: c.swap_count,
+    fdv_usd: null,
+    signal_touch_count: signalTouchCountByMint.get(c.mint) ?? 0,
+    signal_points: signalPointsByMint.get(c.mint) ?? 0,
+    buy_count: c.buy_count,
+    sell_count: c.sell_count,
+    unique_buyers: c.unique_buyers,
+    net_sol_inflow: c.net_sol_inflow,
+    buy_ratio: c.buy_ratio,
+    is_qualified: true,
+  }))
+
+  let itemsInserted = 0
+  if (items.length > 0) {
+    const { error: itemsError } = await supabase.from("trending_items").upsert(items, { onConflict: "snapshot_id,mint" })
+    if (itemsError) throw itemsError
+    itemsInserted = items.length
+  }
+
+  return {
+    snapshot_id: snapshotId,
+    items_inserted: itemsInserted,
+    window_end: windowEndIso,
+    mints_extracted: swapCountByMint.size,
+    qualified_count: sorted.length,
+  }
 }
 
 Deno.serve(async (req) => {
   try {
-    console.log("[marker] ingest-trending hit", new Date().toISOString())
+    console.log("[marker] ingest-trending hit", { ts: new Date().toISOString(), build: INGEST_TRENDING_BUILD })
     const reqStart = Date.now()
     console.log("[timing] request start")
     // Bearer token auth (no Supabase JWT). Set verify_jwt = false for this function so cron can call with header.
@@ -462,46 +397,123 @@ Deno.serve(async (req) => {
     const heliusBaseUrl =
       `https://api-mainnet.helius-rpc.com/v0/addresses/${encodeURIComponent(pumpfunAddress)}/transactions?api-key=${encodeURIComponent(heliusApiKey)}&limit=${HELIUS_PAGE_LIMIT}`
 
-    // Catch-up: now_end = floor(now to minute); last_end = most recent snapshot for window_seconds = 600
-    const nowEndMs = Math.floor(Date.now() / 60000) * 60000
-    const nowEndIso = new Date(nowEndMs).toISOString()
-
-    const { data: lastRow, error: lastErr } = await supabase
-      .from("trending_snapshots")
-      .select("window_end")
-      .eq("window_seconds", WINDOW_SECONDS)
-      .order("window_end", { ascending: false })
-      .limit(1)
+    // Load cursor
+    const { data: stateRow, error: stateErr } = await supabase
+      .from("ingest_state")
+      .select("last_signature")
+      .eq("name", INGEST_STATE_NAME)
       .maybeSingle()
-    if (lastErr) throw lastErr
+    if (stateErr) throw stateErr
+    const lastSignature = (stateRow?.last_signature ?? "").trim() || null
+    console.log("[cursor] loaded last_signature", lastSignature ? "present" : "absent")
 
-    const lastEndRaw = lastRow?.window_end as string | undefined
-    const lastEndMs = lastEndRaw ? new Date(lastEndRaw).getTime() : null
-    const nowEnd = new Date(nowEndMs)
-    // Targets = most recent MAX_WINDOWS_PER_RUN minutes ending at now_end: [ now_end - (k-1) min, ..., now_end ]
-    const targetEndsMs: number[] = []
-    for (let i = MAX_WINDOWS_PER_RUN - 1; i >= 0; i--) {
-      targetEndsMs.push(nowEndMs - i * 60000)
+    const maxPages = lastSignature ? MAX_PAGES_PER_RUN : BOOTSTRAP_MAX_PAGES
+    const buckets = new Map<number, HeliusTx[]>()
+    let beforeSignature: string | undefined = undefined
+    let newLastSignature: string | null = null
+    let stopReason: "hit_last_signature" | "max_pages" | "max_windows" | "max_txs" | "no_more_pages" | null = null
+    let pageNum = 0
+    let totalTxsProcessed = 0
+    let hitCursor = false
+
+    while (pageNum < maxPages) {
+      pageNum += 1
+      const pageUrl = beforeSignature
+        ? `${heliusBaseUrl}&before=${encodeURIComponent(beforeSignature)}`
+        : heliusBaseUrl
+
+      let page: HeliusTx[]
+      try {
+        const res = await fetchWithTimeout(pageUrl, undefined, PAGE_TIMEOUT_MS)
+        if (!res.ok) {
+          throw new Error(`Helius HTTP ${res.status}: ${await res.text()}`)
+        }
+        const data = await res.json()
+        page = Array.isArray(data) ? data : []
+      } catch (e) {
+        if (e instanceof Error && e.message === "fetch timeout") {
+          throw new Error(`Helius fetch timeout page=${pageNum}`)
+        }
+        throw e
+      }
+
+      if (page.length === 0) {
+        stopReason = "no_more_pages"
+        break
+      }
+
+      const firstSig = getTxSignature(page[0])
+      const lastSig = getTxSignature(page[page.length - 1])
+      if (pageNum === 1 && firstSig) newLastSignature = firstSig
+      if (!lastSig || lastSig === beforeSignature) {
+        stopReason = "no_more_pages"
+        break
+      }
+      beforeSignature = lastSig
+
+      for (const tx of page) {
+        const sig = getTxSignature(tx)
+        if (lastSignature && sig === lastSignature) {
+          hitCursor = true
+          stopReason = "hit_last_signature"
+          break
+        }
+        const t = getTxTimeSec(tx)
+        if (t == null) continue
+        const windowEndSec = Math.floor(t / 60) * 60 + 60
+        const windowEndMs = windowEndSec * 1000
+        if (!buckets.has(windowEndMs)) buckets.set(windowEndMs, [])
+        buckets.get(windowEndMs)!.push(tx)
+        totalTxsProcessed += 1
+        if (buckets.size >= MAX_WINDOWS_PER_RUN) {
+          stopReason = "max_windows"
+          break
+        }
+        if (totalTxsProcessed >= MAX_TXS_PER_RUN) {
+          stopReason = "max_txs"
+          break
+        }
+      }
+
+      if (hitCursor || stopReason === "max_windows" || stopReason === "max_txs") break
+      if (pageNum >= maxPages) {
+        stopReason = "max_pages"
+        break
+      }
     }
-    if (lastEndMs != null) {
-      const filtered = targetEndsMs.filter((t) => t > lastEndMs)
-      targetEndsMs.length = 0
-      targetEndsMs.push(...filtered)
-    }
-    console.log("[catchup] targets", { now_end: nowEnd.toISOString(), count: targetEndsMs.length, first: targetEndsMs.length > 0 ? new Date(targetEndsMs[0]).toISOString() : undefined, last: targetEndsMs.length > 0 ? new Date(targetEndsMs[targetEndsMs.length - 1]).toISOString() : undefined })
+    if (!stopReason) stopReason = "max_pages"
+
+    const processed_tx_count = totalTxsProcessed
+    console.log("[cursor] new_last_signature", newLastSignature ?? "(none)")
+    console.log("[cursor] stop_reason", stopReason)
+    console.log("[cursor] processed_tx_count", processed_tx_count)
 
     const windows: Array<{ window_end: string; snapshot_id: string; items_inserted: number }> = []
-    for (const windowEndMs of targetEndsMs) {
+    const windowEndMsList = Array.from(buckets.keys()).sort((a, b) => b - a)
+    for (const windowEndMs of windowEndMsList) {
+      const txsInBucket = buckets.get(windowEndMs) ?? []
       const windowEndIso = new Date(windowEndMs).toISOString()
-      console.log("[timing] window start", windowEndIso)
-      const windowStart = Date.now()
-      const result = await ingestOneWindow(supabase, windowEndMs, signalWalletToWeight, heliusBaseUrl)
-      console.log("[timing] window done", windowEndIso, "ms", Date.now() - windowStart, "items", result.items_inserted)
+      const result = await aggregateAndUpsertWindow(supabase, windowEndMs, txsInBucket, signalWalletToWeight)
+      console.log("[window]", {
+        window_end: windowEndIso,
+        txs_processed_in_bucket: txsInBucket.length,
+        mints_extracted: result.mints_extracted,
+        qualified_count: result.qualified_count,
+        items_upserted: result.items_inserted,
+      })
       windows.push({
         window_end: result.window_end,
         snapshot_id: result.snapshot_id,
         items_inserted: result.items_inserted,
       })
+    }
+
+    if (processed_tx_count > 0 && newLastSignature != null) {
+      const { error: updateErr } = await supabase
+        .from("ingest_state")
+        .update({ last_signature: newLastSignature, updated_at: new Date().toISOString() })
+        .eq("name", INGEST_STATE_NAME)
+      if (updateErr) throw updateErr
     }
 
     let updatedCount = 0
@@ -554,10 +566,11 @@ Deno.serve(async (req) => {
     console.log("[timing] request done ms", Date.now() - reqStart)
     console.log("[marker] ingest-trending success", new Date().toISOString())
 
+    const nowEndIso = new Date(Math.floor(Date.now() / 60000) * 60000).toISOString()
     return new Response(
       JSON.stringify({
         ok: true,
-        mode: "catchup",
+        mode: "cursor",
         now_end: nowEndIso,
         ingested_count: windows.length,
         windows,
