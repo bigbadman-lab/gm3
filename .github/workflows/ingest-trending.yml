@@ -2,35 +2,38 @@ name: ingest-trending
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 jobs:
-  - name: Call ingest-trending
-  env:
-    TOKEN: ${{ secrets.INGEST_TRENDING_TOKEN }}
-  run: |
-    set -euo pipefail
+  call-ingest-trending:
+    name: Call ingest-trending
+    runs-on: ubuntu-latest
+    env:
+      TOKEN: ${{ secrets.INGEST_TRENDING_TOKEN }}
+    steps:
+      - name: Call ingest-trending
+        run: |
+          set -euo pipefail
 
-    echo "Calling ingest-trending..."
+          echo "Calling ingest-trending..."
 
-    # Do NOT use -f, because it hides the response body we need for debugging.
-    # Capture body + HTTP status separately.
-    RESP_FILE="$(mktemp)"
-    HTTP_CODE=$(curl -sS --retry 3 --retry-delay 3 --retry-all-errors \
-      -o "$RESP_FILE" -w "%{http_code}" \
-      -X POST "https://suqopwfezumhvmyvsgjo.supabase.co/functions/v1/ingest-trending" \
-      -H "x-cron-token: $TOKEN" \
-      -H "Authorization: Bearer $TOKEN" \
-      -H "Content-Type: application/json")
+          # Do NOT use -f, because it hides the response body we need for debugging.
+          # Capture body + HTTP status separately.
+          RESP_FILE="$(mktemp)"
+          HTTP_CODE=$(curl -sS --retry 3 --retry-delay 3 --retry-all-errors \
+            -o "$RESP_FILE" -w "%{http_code}" \
+            -X POST "https://suqopwfezumhvmyvsgjo.supabase.co/functions/v1/ingest-trending" \
+            -H "x-cron-token: $TOKEN" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json")
 
-    echo "HTTP $HTTP_CODE"
-    echo "Body:"
-    cat "$RESP_FILE"
-    echo
+          echo "HTTP $HTTP_CODE"
+          echo "Body:"
+          cat "$RESP_FILE"
+          echo
 
-    # Fail the job if not 2xx, but only AFTER printing the body.
-    if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-      exit 1
-    fi
-
+          # Fail the job if not 2xx, but only AFTER printing the body.
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            exit 1
+          fi
