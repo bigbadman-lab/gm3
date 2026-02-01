@@ -5,9 +5,8 @@ concurrency:
   cancel-in-progress: true
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
+
 
 jobs:
   call-ingest-trending:

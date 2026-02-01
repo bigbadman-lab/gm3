@@ -2,7 +2,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
 
-const WINDOW_SECONDS = 600
+const WINDOW_SECONDS = 60
 const HELIUS_FETCH_TIMEOUT_MS = 15_000
 const MAX_WINDOWS_PER_RUN = 5
 const MAX_QUALIFIED_PER_WINDOW = 200
@@ -293,10 +293,10 @@ async function aggregateAndUpsertWindow(
     const total_swaps = buy_count + sell_count
     const buy_ratio = total_swaps === 0 ? 0 : Math.min(1, Math.max(0, buy_count / total_swaps))
     const is_qualified =
-      unique_buyers >= 20 &&
+      unique_buyers >= 5 &&
       buy_ratio >= 0.65 &&
-      net_sol_inflow >= 3 &&
-      swap_count >= 25
+      net_sol_inflow >= 1 &&
+      swap_count >= 10
     if (is_qualified) {
       qualifiedCandidates.push({ mint, swap_count, buy_count, sell_count, unique_buyers, net_sol_inflow, buy_ratio, is_qualified: true })
     }
