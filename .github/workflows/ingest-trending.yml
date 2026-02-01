@@ -1,5 +1,9 @@
 name: ingest-trending
 
+concurrency:
+  group: ingest-trending
+  cancel-in-progress: true
+
 on:
   schedule:
     - cron: "*/5 * * * *"
