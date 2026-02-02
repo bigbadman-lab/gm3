@@ -51,15 +51,10 @@ function json(status: number, body: unknown) {
 }
 
 Deno.serve(async (req) => {
-  // Token read only from env. Local dev: shell `export` does not reach the function process;
-  // Supabase CLI starts a separate Deno process and only injects env from --env-file or
-  // (when deployed) from `supabase secrets set`. Use e.g. `supabase functions serve --env-file .env`.
+  // Require x-cron-token header only (distinct from ingest-trending). Env is set via
+  // supabase secrets set ATH_UPDATER_TOKEN or --env-file when serving locally.
   const expected = Deno.env.get("ATH_UPDATER_TOKEN") ?? "";
-  const auth = (req.headers.get("authorization") ?? "").trim();
-  const xcron = (req.headers.get("x-cron-token") ?? "").trim();
-  const bearer =
-    auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
-  const provided = bearer || xcron;
+  const provided = (req.headers.get("x-cron-token") ?? "").trim();
 
   if (!expected || provided !== expected) {
     return new Response(JSON.stringify({ error: "unauthorized" }), {
@@ -87,7 +82,7 @@ Deno.serve(async (req) => {
   let archived = 0;
   const errors: string[] = [];
 
-  const { data: dueRows, error: dueErr } = await supabase.rpc("get_due_ath_mints", { lim: 1 });
+  const { data: dueRows, error: dueErr } = await supabase.rpc("get_due_ath_mints", { lim: 25 });
 
   if (dueErr) {
     return json(500, { ok: false, error: dueErr.message });
@@ -106,7 +101,7 @@ Deno.serve(async (req) => {
       continue;
     }
     const fdvUsd = birdeyeResult.fdv;
-    const { data: rowsUpdated, error: updateErr } = await supabase.rpc("update_ath_for_mint", {
+    const { data: rpcData, error: updateErr } = await supabase.rpc("update_ath_for_mint", {
       p_mint: row.mint,
       p_current_fdv_usd: fdvUsd,
     });
@@ -115,11 +110,15 @@ Deno.serve(async (req) => {
       errors.push(`${row.mint}: ${updateErr.message}`);
       continue;
     }
-    if (rowsUpdated === 1) {
-      updated += 1;
-    } else {
+    const firstRow = Array.isArray(rpcData) ? rpcData[0] : rpcData != null && typeof rpcData === "object" ? rpcData : undefined;
+    const didUpdate = Boolean(firstRow?.updated);
+    const didArchive = Boolean(firstRow?.archived);
+    if (firstRow === undefined) {
       skipped += 1;
-      errors.push(`${row.mint}: update row_count=${rowsUpdated}`);
+      errors.push(`${row.mint}: unexpected RPC return ${JSON.stringify(rpcData)}`);
+    } else {
+      if (didUpdate) updated += 1; else skipped += 1;
+      if (didArchive) archived += 1;
     }
   }
 
