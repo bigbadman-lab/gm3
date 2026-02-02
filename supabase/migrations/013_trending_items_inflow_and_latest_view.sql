@@ -6,7 +6,9 @@ alter table public.trending_items
   add column if not exists is_alertworthy boolean;
 
 -- View: one row per mint, the row with the latest updated_at
-create or replace view public.trending_items_latest as
+drop view if exists public.trending_items_latest;
+
+create view public.trending_items_latest as
 select distinct on (mint)
   snapshot_id,
   rank,

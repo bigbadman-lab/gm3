@@ -1,7 +1,7 @@
--- Fix view column order: preserve exact order from 013, append new columns at the end.
--- CREATE OR REPLACE VIEW is positional; 014/015 inserted columns before updated_at and broke the view.
+-- Fix view column order: drop and recreate so column list can change (CREATE OR REPLACE cannot rename/reorder columns).
+drop view if exists public.trending_items_latest;
 
-create or replace view public.trending_items_latest as
+create view public.trending_items_latest as
 select distinct on (mint)
   snapshot_id,
   rank,

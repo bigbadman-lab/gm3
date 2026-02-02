@@ -127,7 +127,9 @@ create trigger trg_set_inflow_signal_fields
   execute function public.set_inflow_signal_fields();
 
 -- 5) View: include capital_efficiency, mc_structure_ok, mc_structure_reason for /v1/today
-create or replace view public.trending_items_latest as
+drop view if exists public.trending_items_latest;
+
+create view public.trending_items_latest as
 select distinct on (mint)
   snapshot_id,
   rank,

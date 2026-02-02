@@ -84,8 +84,11 @@ create trigger trg_set_inflow_signal_fields
   execute function public.set_inflow_signal_fields();
 
 -- 5) View: include mc_floor_ok, mc_floor_reason for /v1/today
-create or replace view public.trending_items_latest as
-select distinct on (mint)
+-- 5) View: include mc_floor_ok, mc_floor_reason for /v1/today
+DROP VIEW IF EXISTS public.trending_items_latest;
+
+CREATE VIEW public.trending_items_latest AS
+SELECT DISTINCT ON (mint)
   snapshot_id,
   rank,
   mint,
@@ -106,5 +109,6 @@ select distinct on (mint)
   mc_floor_ok,
   mc_floor_reason,
   updated_at
-from public.trending_items
-order by mint, updated_at desc;
+FROM public.trending_items
+ORDER BY mint, updated_at DESC;
+

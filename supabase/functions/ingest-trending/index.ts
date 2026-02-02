@@ -517,10 +517,12 @@ Deno.serve(async (req) => {
     }
 
     let updatedCount = 0
+    let wroteFirstAlert = false
     try {
       const enrichEnabled = (Deno.env.get("FDV_ENRICH_ENABLED") ?? "true") !== "false"
       const requireQualified = (Deno.env.get("FDV_REQUIRE_QUALIFIED") ?? "true") !== "false"
       const birdeyeKey = Deno.env.get("BIRDEYE_API_KEY") ?? ""
+      const firstWindowEnd = windows.length ? windows[0].window_end : new Date().toISOString()
       if (enrichEnabled && birdeyeKey) {
         let candidatesQuery = supabase
           .from("trending_items")
@@ -551,11 +553,30 @@ Deno.serve(async (req) => {
               typeof total_supply !== "number" || !Number.isFinite(total_supply) ||
               typeof fdv_usd !== "number" || !Number.isFinite(fdv_usd)
             ) continue
-            const { error: updateErr } = await supabase
+            const { data: updatedRows, error: updateErr } = await supabase
               .from("trending_items")
               .update({ price_usd, total_supply, fdv_usd, updated_at: new Date().toISOString() })
               .eq("mint", mint)
-            if (!updateErr) updatedCount++
+              .select("is_alertworthy")
+            if (!updateErr) {
+              updatedCount++
+              const rows = (updatedRows ?? []) as { is_alertworthy?: boolean }[]
+              const isAlertworthy = rows.length === 1
+                ? rows[0]?.is_alertworthy === true
+                : rows.some((r) => r.is_alertworthy === true)
+              if (isAlertworthy) {
+                const { error: rpcErr } = await supabase.rpc("set_first_alert_once", {
+                  p_mint: mint,
+                  p_first_alert_window_end: firstWindowEnd,
+                  p_entry_fdv_usd: fdv_usd,
+                })
+                if (rpcErr) {
+                  console.error("[set_first_alert_once]", mint, rpcErr.message)
+                } else {
+                  wroteFirstAlert = true
+                }
+              }
+            }
           }
         }
       }
@@ -574,6 +595,7 @@ Deno.serve(async (req) => {
         now_end: nowEndIso,
         ingested_count: windows.length,
         windows,
+        wroteFirstAlert,
       }),
       { headers: { "Content-Type": "application/json" } },
     )
