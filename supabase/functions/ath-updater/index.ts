@@ -65,12 +65,14 @@ Deno.serve(async (req) => {
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const birdeyeDisabledRaw = (Deno.env.get("BIRDEYE_DISABLED") ?? "").trim().toLowerCase();
+  const birdeyeDisabled = ["true", "1", "yes"].includes(birdeyeDisabledRaw);
   const birdeyeKey = Deno.env.get("BIRDEYE_API_KEY");
 
   if (!supabaseUrl || !serviceKey) {
     return json(500, { ok: false, error: "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY" });
   }
-  if (!birdeyeKey) {
+  if (!birdeyeDisabled && !birdeyeKey) {
     return json(500, { ok: false, error: "Missing BIRDEYE_API_KEY" });
   }
 
@@ -82,6 +84,16 @@ Deno.serve(async (req) => {
   let archived = 0;
   const errors: string[] = [];
 
+  const birdeyeCapRaw = Deno.env.get("BIRDEYE_MAX_CALLS_PER_RUN");
+  const birdeyeCap = birdeyeCapRaw != null && birdeyeCapRaw !== "" ? parseInt(birdeyeCapRaw, 10) : null;
+  const birdeyeCapEnabled = birdeyeCap != null && !Number.isNaN(birdeyeCap) && birdeyeCap >= 0;
+  let birdeyeCallCount = 0;
+  let birdeyeCappedLogged = false;
+
+  if (birdeyeDisabled) {
+    console.log("[ath-updater] BIRDEYE_DISABLED enabled, skipping all Birdeye fetches for this run");
+  }
+
   const { data: dueRows, error: dueErr } = await supabase.rpc("get_due_ath_mints", { lim: 25 });
 
   if (dueErr) {
@@ -92,7 +104,22 @@ Deno.serve(async (req) => {
   processed = due.length;
 
   for (const row of due) {
-    const birdeyeResult = await fetchBirdeyeFdv(row.mint, birdeyeKey);
+    if (birdeyeDisabled) {
+      skipped += 1;
+      errors.push(`${row.mint}: skipped (Birdeye disabled)`);
+      continue;
+    }
+    birdeyeCallCount += 1;
+    if (birdeyeCapEnabled && birdeyeCallCount > birdeyeCap!) {
+      if (!birdeyeCappedLogged) {
+        console.log("[ath-updater] birdeye capped at", birdeyeCap, "calls; skipping remaining");
+        birdeyeCappedLogged = true;
+      }
+      skipped += 1;
+      errors.push(`${row.mint}: skipped (Birdeye cap)`);
+      continue;
+    }
+    const birdeyeResult = await fetchBirdeyeFdv(row.mint, birdeyeKey!);
     if (!birdeyeResult.ok) {
       skipped += 1;
       errors.push(

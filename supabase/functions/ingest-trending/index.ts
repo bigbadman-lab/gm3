@@ -521,9 +521,19 @@ Deno.serve(async (req) => {
     try {
       const enrichEnabled = (Deno.env.get("FDV_ENRICH_ENABLED") ?? "true") !== "false"
       const requireQualified = (Deno.env.get("FDV_REQUIRE_QUALIFIED") ?? "true") !== "false"
+      const birdeyeDisabledRaw = (Deno.env.get("BIRDEYE_DISABLED") ?? "").trim().toLowerCase()
+      const birdeyeDisabled = ["true", "1", "yes"].includes(birdeyeDisabledRaw)
       const birdeyeKey = Deno.env.get("BIRDEYE_API_KEY") ?? ""
       const firstWindowEnd = windows.length ? windows[0].window_end : new Date().toISOString()
-      if (enrichEnabled && birdeyeKey) {
+      if (birdeyeDisabled) {
+        console.log("[ingest-trending] BIRDEYE_DISABLED enabled, skipping FDV enrichment")
+      }
+      if (enrichEnabled && birdeyeKey && !birdeyeDisabled) {
+        const birdeyeCapRaw = Deno.env.get("BIRDEYE_MAX_CALLS_PER_RUN")
+        const birdeyeCap = birdeyeCapRaw != null && birdeyeCapRaw !== "" ? parseInt(birdeyeCapRaw, 10) : null
+        const birdeyeCapEnabled = birdeyeCap != null && !Number.isNaN(birdeyeCap) && birdeyeCap >= 0
+        let birdeyeCallCount = 0
+        let birdeyeCappedLogged = false
         let candidatesQuery = supabase
           .from("trending_items")
           .select("mint")
@@ -536,6 +546,14 @@ Deno.serve(async (req) => {
           .limit(10)
         if (!candidatesErr && candidates?.length) {
           for (const row of candidates) {
+            birdeyeCallCount += 1
+            if (birdeyeCapEnabled && birdeyeCallCount > birdeyeCap) {
+              if (!birdeyeCappedLogged) {
+                console.log("[ingest-trending] birdeye capped at", birdeyeCap, "calls; skipping remaining")
+                birdeyeCappedLogged = true
+              }
+              continue
+            }
             const mint = row.mint
             const url = `https://public-api.birdeye.so/defi/token_overview?address=${encodeURIComponent(mint)}`
             const res = await fetch(url, {
