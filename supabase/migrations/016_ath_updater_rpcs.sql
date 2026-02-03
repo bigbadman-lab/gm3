@@ -1,6 +1,22 @@
 -- RPCs for ath-updater Edge Function: locked select of due mints + single-row update with next_check_ts/archive.
 -- Self-contained: create referenced tables if missing so migration runs even if earlier migrations weren't applied.
 
+-- Used by update_ath_for_mint to set next_check_ts: 1 min if <6h, 10 min if <24h, 12h if <7d, else 365d.
+create or replace function public.compute_next_check_ts(entry_ts timestamptz, now_ts timestamptz)
+returns timestamptz
+language sql
+security definer
+set search_path = public
+as $$
+  select
+    case
+      when now_ts - entry_ts < interval '6 hours' then now_ts + interval '1 minute'
+      when now_ts - entry_ts < interval '24 hours' then now_ts + interval '10 minutes'
+      when now_ts - entry_ts < interval '7 days' then now_ts + interval '12 hours'
+      else now_ts + interval '365 days'
+    end;
+$$;
+
 -- Tables referenced by get_due_ath_mints and update_ath_for_mint
 create table if not exists public.token_ath (
   mint text not null primary key,

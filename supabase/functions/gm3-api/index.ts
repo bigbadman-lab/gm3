@@ -74,6 +74,13 @@ function requirePaidSession(req: Request): Response | null {
   return null;
 }
 
+function getServiceClient(): ReturnType<typeof createClient> | null {
+  const url = Deno.env.get("SUPABASE_URL") ?? "";
+  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+  if (!url || !key) return null;
+  return createClient(url, key, { auth: { persistSession: false } });
+}
+
 // ---------- handler ----------
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return json({ ok: true }, 200);
@@ -126,30 +133,36 @@ Deno.serve(async (req) => {
     return json({ data: data?.[0] ?? null });
   }
 
-  // -------- PAID (requires GM3 session only) --------
+  // -------- PAID (requires GM3 session only; DB reads use service role) --------
   if (path.startsWith("/v1/paid/")) {
     const sessionErr = requirePaidSession(req);
     if (sessionErr) return sessionErr;
 
+    const svc = getServiceClient();
+    if (!svc) return json({ error: "missing_server_secrets" }, 500);
+
     if (req.method === "GET" && path === "/v1/paid/qualified") {
-      const { data, error } = await supabase.from("v_layer_qualified_60").select("*");
+      const { data, error } = await svc.from("v_layer_qualified_60").select("*");
       if (error) return json({ error: "query_failed", details: error.message }, 500);
       return json({ data });
     }
 
     if (req.method === "GET" && path === "/v1/paid/alertworthy") {
-      const { data, error } = await supabase
+      if (!(Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "").trim()) {
+        return json({ error: "missing_service_role_key" }, 500);
+      }
+      const { data, error } = await svc
         .from("v_paid_alertworthy_60")
         .select("*")
         .order("updated_at", { ascending: false })
         .limit(25);
       if (error) return json({ error: "query_failed", details: error.message }, 500);
       const rows = data ?? [];
+      console.log("[paid-alertworthy] rows", rows.length);
       const max_updated_at =
         (data && data.length)
           ? data.reduce((max, r) => (!max || (r as { updated_at?: string }).updated_at > max ? (r as { updated_at?: string }).updated_at : max), null as string | null)
           : null;
-      console.log("[paid-alertworthy]", { rows: data?.length ?? 0, max_updated_at });
       return json({
         data: rows,
         server_time: new Date().toISOString(),
@@ -158,18 +171,21 @@ Deno.serve(async (req) => {
     }
 
     if (req.method === "GET" && path === "/v1/paid/investable") {
-      const { data, error } = await supabase
+      if (!(Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "").trim()) {
+        return json({ error: "missing_service_role_key" }, 500);
+      }
+      const { data, error } = await svc
         .from("v_paid_investable_60")
         .select("*")
         .order("updated_at", { ascending: false })
         .limit(25);
       if (error) return json({ error: "query_failed", details: error.message }, 500);
       const rows = data ?? [];
+      console.log("[paid-investable] rows", rows.length);
       const max_updated_at =
         (data && data.length)
           ? data.reduce((max, r) => (!max || (r as { updated_at?: string }).updated_at > max ? (r as { updated_at?: string }).updated_at : max), null as string | null)
           : null;
-      console.log("[paid-investable]", { rows: data?.length ?? 0, max_updated_at });
       return json({
         data: rows,
         server_time: new Date().toISOString(),
@@ -181,7 +197,7 @@ Deno.serve(async (req) => {
       const url = new URL(req.url);
       const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "200", 10) || 200, 500);
 
-      const { data, error } = await supabase
+      const { data, error } = await svc
         .from("v_mint_alert_outcomes")
         .select("*")
         .order("first_alert_ts", { ascending: false })
