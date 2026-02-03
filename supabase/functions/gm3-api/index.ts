@@ -1,5 +1,8 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import md5 from "https://esm.sh/blueimp-md5@2.19.0";
+import { hashSessionToken } from "./lib/crypto.ts";
+import { requireSession } from "./lib/session.ts";
+import { verifyStripeWebhook } from "./lib/stripe_webhook.ts";
 
 export const config = { verify_jwt: false };
 
@@ -35,6 +38,21 @@ function getRestPath(req: Request): string {
   return "/" + parts.slice(idx + 1).join("/");
 }
 
+function isString(v: unknown): v is string {
+  return typeof v === "string";
+}
+
+async function parseJsonBody(req: Request): Promise<Record<string, unknown> | null> {
+  try {
+    const text = await req.text();
+    if (!text.trim()) return null;
+    const parsed = JSON.parse(text);
+    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function requireApiKey(
   supabase: any,
   req: Request
@@ -66,14 +84,6 @@ async function requireApiKey(
   return { tier: data.tier ?? "paid", prefix: data.prefix ?? "" };
 }
 
-function requirePaidSession(req: Request): Response | null {
-  const auth = (req.headers.get("Authorization") ?? "").trim();
-  if (!auth.toLowerCase().startsWith("bearer ")) return json({ error: "missing_paid_session" }, 401);
-  const token = auth.slice(7).trim();
-  if (!token.startsWith("gm3_sess_")) return json({ error: "invalid_paid_session" }, 401);
-  return null;
-}
-
 function getServiceClient(): ReturnType<typeof createClient> | null {
   const url = Deno.env.get("SUPABASE_URL") ?? "";
   const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
@@ -86,6 +96,14 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return json({ ok: true }, 200);
 
   const path = getRestPath(req);
+
+  if (req.method === "GET" && path === "/v1/_debug/path") {
+    return json({
+      url: req.url,
+      method: req.method,
+      path,
+    });
+  }
 
   // GET /v1/meta: no auth, no secrets; handle before any other checks
   if (req.method === "GET" && path === "/v1/meta") {
@@ -120,6 +138,152 @@ Deno.serve(async (req) => {
     auth: { persistSession: false },
   });
 
+  if (req.method === "GET" && path === "/v1/_debug/routes") {
+    return json({
+      ok: true,
+      hasAuthMe: true,
+    });
+  }
+
+  // POST /v1/webhooks/stripe — expects Stripe-Signature; raw body used for verification.
+  if (req.method === "POST" && path === "/v1/webhooks/stripe") {
+    const rawBody = await req.text();
+    const signatureHeader = req.headers.get("Stripe-Signature") ?? "";
+    const secret = (Deno.env.get("STRIPE_WEBHOOK_SECRET") ?? "").trim();
+    if (!signatureHeader || !secret) {
+      return json({ ok: false, error: "invalid_signature" }, 400);
+    }
+    const valid = await verifyStripeWebhook(rawBody, signatureHeader, secret);
+    if (!valid) {
+      return json({ ok: false, error: "invalid_signature" }, 400);
+    }
+    let event: Record<string, unknown>;
+    try {
+      event = JSON.parse(rawBody) as Record<string, unknown>;
+    } catch {
+      return json({ ok: false, error: "invalid_signature" }, 400);
+    }
+    if (event.type !== "checkout.session.completed") {
+      return json({ ok: true });
+    }
+    const session = (event.data as Record<string, unknown> | undefined)?.object as Record<string, unknown> | undefined;
+    if (!session || typeof session.id !== "string") {
+      return json({ ok: true });
+    }
+    const customerDetails = session.customer_details as Record<string, unknown> | undefined;
+    const metadata = (session.metadata as Record<string, unknown>) ?? {};
+    const external_id = session.id;
+    const email = (customerDetails?.email ?? session.customer_email ?? null) as string | null;
+    const amount_total = (session.amount_total as number | null | undefined) ?? null;
+    const currency = (session.currency as string | null | undefined) ?? null;
+    const tierVal = metadata?.tier ?? metadata?.tier_name ?? null;
+    const tierStr = tierVal != null ? String(tierVal) : null;
+    const svc = getServiceClient();
+    if (!svc) return json({ ok: false, error: "db_error" }, 500);
+    const { error } = await svc.from("access_events").upsert(
+      {
+        source: "stripe",
+        external_id,
+        status: "confirmed",
+        tier: tierStr,
+        email,
+        amount: amount_total,
+        currency,
+        metadata,
+      },
+      { onConflict: "source,external_id" }
+    );
+    if (error) return json({ ok: false, error: "db_error" }, 500);
+    return json({ ok: true });
+  }
+
+  // GET /v1/auth/me: Bearer gm3_sess_* required; validates against access_sessions (revoked, expires_at).
+  // curl -sS "https://api.gm3.fun/functions/v1/gm3-api/v1/auth/me" -H "Authorization: Bearer gm3_sess_XXXX" | jq
+  if (req.method === "GET" && path === "/v1/auth/me") {
+    console.log("HIT /v1/auth/me");
+    const svc = getServiceClient();
+    if (!svc) return json({ error: "missing_server_secrets" }, 500);
+    const check = await requireSession(req, svc);
+    if (!check.ok) return json(check.body, check.status);
+    const { session } = check;
+    return json({
+      ok: true,
+      is_paid: true,
+      plan: session.tier ?? null,
+      expires_at: session.expires_at,
+      session_id: session.id,
+    });
+  }
+
+  // POST /v1/auth/mint/stripe — exchange confirmed Stripe session for gm3_sess_ token.
+  // curl -i -sS "https://api.gm3.fun/functions/v1/gm3-api/v1/auth/mint/stripe" -H "Content-Type: application/json" -d '{"session_id":"cs_test_123"}'
+  if (req.method === "POST" && path === "/v1/auth/mint/stripe") {
+    const body = await parseJsonBody(req);
+    if (!body || !isString(body.session_id)) {
+      return json({ ok: false, error: "invalid_body" }, 422);
+    }
+    const session_id = body.session_id;
+    const svc = getServiceClient();
+    if (!svc) return json({ error: "missing_server_secrets" }, 500);
+
+    // Idempotency: if a session was already minted for this Stripe checkout, do not mint again.
+    const { data: existingSession } = await svc
+      .from("access_sessions")
+      .select("id")
+      .eq("method", `stripe:${session_id}`)
+      .eq("revoked", false)
+      .gt("expires_at", new Date().toISOString())
+      .limit(1)
+      .maybeSingle();
+    if (existingSession) {
+      return json({ ok: false, error: "already_minted" }, 409);
+    }
+
+    const { data: event, error: queryError } = await svc
+      .from("access_events")
+      .select("tier, email, amount, currency, metadata")
+      .eq("source", "stripe")
+      .eq("external_id", session_id)
+      .eq("status", "confirmed")
+      .maybeSingle();
+    if (queryError) return json({ ok: false, error: "db_error" }, 500);
+    if (!event) return json({ ok: false, error: "payment_not_confirmed" }, 402);
+    const tier = (event.tier as string | null) ?? "alertworthy";
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+    const token = `gm3_sess_${hex}`;
+    const token_hash = hashSessionToken(token);
+    const expires_at = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    const { error: insertError } = await svc.from("access_sessions").insert({
+      session_token_hash: token_hash,
+      tier,
+      method: `stripe:${session_id}`,
+      expires_at,
+      revoked: false,
+    });
+    if (insertError) return json({ ok: false, error: "db_error" }, 500);
+    return json({ ok: true, token, tier, expires_at });
+  }
+
+  // POST /v1/auth/mint/solana — scaffolding; payment verification not implemented
+  if (req.method === "POST" && path === "/v1/auth/mint/solana") {
+    const body = await parseJsonBody(req);
+    if (!body || !isString(body.signature)) {
+      return json({ ok: false, error: "invalid_body" }, 422);
+    }
+    return json({ ok: false, error: "not_implemented" }, 501);
+  }
+
+  // POST /v1/auth/mint/token-gate — scaffolding; payment verification not implemented
+  if (req.method === "POST" && path === "/v1/auth/mint/token-gate") {
+    const body = await parseJsonBody(req);
+    if (!body || !isString(body.wallet) || !isString(body.message) || !isString(body.signature)) {
+      return json({ ok: false, error: "invalid_body" }, 422);
+    }
+    return json({ ok: false, error: "not_implemented" }, 501);
+  }
+
   // -------- FREE (no API key) --------
   if (req.method === "GET" && path === "/v1/free/qualified") {
     const { data, error } = await supabase.rpc("free_qualified_feed");
@@ -135,11 +299,10 @@ Deno.serve(async (req) => {
 
   // -------- PAID (requires GM3 session only; DB reads use service role) --------
   if (path.startsWith("/v1/paid/")) {
-    const sessionErr = requirePaidSession(req);
-    if (sessionErr) return sessionErr;
-
     const svc = getServiceClient();
     if (!svc) return json({ error: "missing_server_secrets" }, 500);
+    const check = await requireSession(req, svc);
+    if (!check.ok) return json(check.body, check.status);
 
     if (req.method === "GET" && path === "/v1/paid/qualified") {
       const { data, error } = await svc.from("v_layer_qualified_60").select("*");
@@ -148,9 +311,6 @@ Deno.serve(async (req) => {
     }
 
     if (req.method === "GET" && path === "/v1/paid/alertworthy") {
-      if (!(Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "").trim()) {
-        return json({ error: "missing_service_role_key" }, 500);
-      }
       const { data, error } = await svc
         .from("v_paid_alertworthy_60")
         .select("*")
@@ -171,9 +331,6 @@ Deno.serve(async (req) => {
     }
 
     if (req.method === "GET" && path === "/v1/paid/investable") {
-      if (!(Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "").trim()) {
-        return json({ error: "missing_service_role_key" }, 500);
-      }
       const { data, error } = await svc
         .from("v_paid_investable_60")
         .select("*")
