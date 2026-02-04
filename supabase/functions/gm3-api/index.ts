@@ -284,6 +284,240 @@ Deno.serve(async (req) => {
     return json({ ok: false, error: "not_implemented" }, 501);
   }
 
+  // POST /v1/device-pair/start — start QR pairing; requires valid gm3 session
+  if (req.method === "POST" && path === "/v1/device-pair/start") {
+    const svc = getServiceClient();
+    if (!svc) return json({ error: "missing_server_secrets" }, 500);
+    const check = await requireSession(req, svc);
+    if (!check.ok) return json(check.body, check.status);
+
+    const { data: sessionRow } = await svc
+      .from("access_sessions")
+      .select("method")
+      .eq("id", check.session.id)
+      .maybeSingle();
+    const method = (sessionRow as { method?: string } | null)?.method ?? "";
+    const root_session_id = method.startsWith("pair:") ? method.slice(5).trim() : check.session.id;
+
+    const nowIso = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 2 * 60 * 1000).toISOString();
+
+    const { error: cancelErr } = await svc
+      .from("device_pairings")
+      .update({ status: "cancelled" })
+      .eq("root_session_id", root_session_id)
+      .eq("status", "pending")
+      .gt("expires_at", nowIso);
+    if (cancelErr) return json({ ok: false, error: "pairing_error" }, 500);
+
+    const maxRetries = 5;
+    let code: string | null = null;
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      const bytes = new Uint8Array(6);
+      crypto.getRandomValues(bytes);
+      code = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+      const { error: insertErr } = await svc.from("device_pairings").insert({
+        root_session_id,
+        code,
+        status: "pending",
+        expires_at: expiresAt,
+      });
+      if (!insertErr) break;
+      if (insertErr.code === "23505") continue; // unique_violation
+      return json({ ok: false, error: "pairing_error" }, 500);
+    }
+    if (!code) return json({ ok: false, error: "pairing_error" }, 500);
+
+    const PAIR_BASE_URL = Deno.env.get("PAIR_BASE_URL") ?? "https://gm3.fun";
+    const pair_url = `${PAIR_BASE_URL}/pair?code=${encodeURIComponent(code)}`;
+
+    return json({
+      code,
+      pair_url,
+      expires_at: expiresAt,
+    });
+  }
+
+  // POST /v1/device-pair/complete — complete QR pairing; no auth required (pairing code is sufficient)
+  if (req.method === "POST" && path === "/v1/device-pair/complete") {
+    const svc = getServiceClient();
+    if (!svc) return json({ ok: false, error: "pairing_error" }, 500);
+
+    const body = await parseJsonBody(req);
+    if (!body || !isString(body.code) || !isString(body.device_id)) {
+      return json({ ok: false, error: "invalid_body" }, 422);
+    }
+    const code = body.code.trim();
+    const device_id = body.device_id.trim();
+    const device_label = isString(body.device_label) ? body.device_label.trim() : null;
+    const user_agent = isString(body.user_agent) ? body.user_agent.trim() : (req.headers.get("user-agent") ?? null);
+    const consumed_ip = (req.headers.get("x-forwarded-for") ?? req.headers.get("x-real-ip") ?? "").split(",")[0]?.trim() || null;
+
+    const { data: pairing, error: pairErr } = await svc
+      .from("device_pairings")
+      .select("id, root_session_id, status, expires_at")
+      .eq("code", code)
+      .maybeSingle();
+    if (pairErr) return json({ ok: false, error: "pairing_error" }, 500);
+    if (!pairing) return json({ ok: false, error: "pair_not_found" }, 404);
+
+    const pairingRow = pairing as { status: string; expires_at: string; root_session_id: string };
+    if (pairingRow.status !== "pending") {
+      return json({ ok: false, error: "pair_not_pending" }, 409);
+    }
+    const nowIso = new Date().toISOString();
+    if (new Date(pairingRow.expires_at).getTime() <= Date.now()) {
+      await svc.from("device_pairings").update({ status: "expired" }).eq("code", code);
+      return json({ ok: false, error: "pair_expired" }, 410);
+    }
+
+    const root_session_id = pairingRow.root_session_id;
+    const { data: rootSession, error: rootErr } = await svc
+      .from("access_sessions")
+      .select("id, tier, expires_at")
+      .eq("id", root_session_id)
+      .eq("revoked", false)
+      .gt("expires_at", nowIso)
+      .maybeSingle();
+    if (rootErr) return json({ ok: false, error: "pairing_error" }, 500);
+    if (!rootSession) return json({ ok: false, error: "root_invalid" }, 401);
+
+    const rootRow = rootSession as { tier: string | null; expires_at: string };
+    const tier = rootRow.tier ?? "alertworthy";
+    const expires_at = rootRow.expires_at;
+
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+    const token = `gm3_sess_${hex}`;
+    const token_hash = hashSessionToken(token);
+    const { data: insertedRows, error: insertErr } = await svc
+      .from("access_sessions")
+      .insert({
+        session_token_hash: token_hash,
+        tier,
+        method: `pair:${root_session_id}`,
+        expires_at,
+        revoked: false,
+      })
+      .select("id")
+      .limit(1);
+    if (insertErr || !insertedRows?.length) return json({ ok: false, error: "pairing_error" }, 500);
+    const newSessionId = (insertedRows[0] as { id: string }).id;
+
+    const { error: updatePairErr } = await svc
+      .from("device_pairings")
+      .update({
+        status: "completed",
+        completed_at: nowIso,
+        consumed_by_device_id: device_id,
+        consumed_user_agent: user_agent,
+        consumed_ip: consumed_ip,
+      })
+      .eq("code", code);
+    if (updatePairErr) return json({ ok: false, error: "pairing_error" }, 500);
+
+    const { error: upsertErr } = await svc.from("device_links").upsert(
+      {
+        root_session_id,
+        linked_session_id: newSessionId,
+        linked_device_id: device_id,
+        linked_device_label: device_label,
+        linked_user_agent: user_agent,
+        linked_created_at: nowIso,
+        revoked_at: null,
+      },
+      { onConflict: "root_session_id" }
+    );
+    if (upsertErr) return json({ ok: false, error: "pairing_error" }, 500);
+
+    return json({
+      ok: true,
+      token,
+      expires_at,
+      tier,
+      root_session_id,
+    });
+  }
+
+  // GET /v1/device-pair/status?code=... — check pairing status; caller must own root session
+  if (req.method === "GET" && path === "/v1/device-pair/status") {
+    const svc = getServiceClient();
+    if (!svc) return json({ ok: false, error: "pairing_error" }, 500);
+    const check = await requireSession(req, svc);
+    if (!check.ok) return json(check.body, check.status);
+
+    const { data: sessionRow } = await svc
+      .from("access_sessions")
+      .select("method")
+      .eq("id", check.session.id)
+      .maybeSingle();
+    const method = (sessionRow as { method?: string } | null)?.method ?? "";
+    const root_session_id = method.startsWith("pair:") ? method.slice(5).trim() : check.session.id;
+
+    const codeParam = new URL(req.url).searchParams.get("code");
+    if (codeParam == null || typeof codeParam !== "string" || !codeParam.trim()) {
+      return json({ ok: false, error: "invalid_code" }, 422);
+    }
+    const code = codeParam.trim();
+
+    const { data: pairing, error: pairErr } = await svc
+      .from("device_pairings")
+      .select("root_session_id, status, expires_at")
+      .eq("code", code)
+      .maybeSingle();
+    if (pairErr) return json({ ok: false, error: "pairing_error" }, 500);
+    if (!pairing) return json({ ok: false, error: "pair_not_found" }, 404);
+
+    const p = pairing as { root_session_id: string; status: string; expires_at: string };
+    if (p.root_session_id !== root_session_id) {
+      return json({ ok: false, error: "forbidden" }, 403);
+    }
+    return json({ ok: true, status: p.status, expires_at: p.expires_at });
+  }
+
+  // POST /v1/device-link/unlink — revoke linked device for root session
+  if (req.method === "POST" && path === "/v1/device-link/unlink") {
+    const svc = getServiceClient();
+    if (!svc) return json({ ok: false, error: "pairing_error" }, 500);
+    const check = await requireSession(req, svc);
+    if (!check.ok) return json(check.body, check.status);
+
+    const { data: sessionRow } = await svc
+      .from("access_sessions")
+      .select("method")
+      .eq("id", check.session.id)
+      .maybeSingle();
+    const method = (sessionRow as { method?: string } | null)?.method ?? "";
+    const root_session_id = method.startsWith("pair:") ? method.slice(5).trim() : check.session.id;
+
+    const { data: linkRow, error: linkErr } = await svc
+      .from("device_links")
+      .select("linked_session_id")
+      .eq("root_session_id", root_session_id)
+      .is("revoked_at", null)
+      .maybeSingle();
+    if (linkErr) return json({ ok: false, error: "pairing_error" }, 500);
+    if (!linkRow) return json({ ok: true, unlinked: false });
+
+    const linked_session_id = (linkRow as { linked_session_id: string }).linked_session_id;
+    const nowIso = new Date().toISOString();
+
+    const { error: updateLinkErr } = await svc
+      .from("device_links")
+      .update({ revoked_at: nowIso })
+      .eq("root_session_id", root_session_id);
+    if (updateLinkErr) return json({ ok: false, error: "pairing_error" }, 500);
+
+    const { error: revokeErr } = await svc
+      .from("access_sessions")
+      .update({ revoked: true })
+      .eq("id", linked_session_id);
+    if (revokeErr) return json({ ok: false, error: "pairing_error" }, 500);
+
+    return json({ ok: true, unlinked: true });
+  }
+
   // -------- FREE (no API key) --------
   if (req.method === "GET" && path === "/v1/free/qualified") {
     const { data, error } = await supabase.rpc("free_qualified_feed");
@@ -318,7 +552,8 @@ Deno.serve(async (req) => {
         .limit(25);
       if (error) return json({ error: "query_failed", details: error.message }, 500);
       const rows = data ?? [];
-      console.log("[paid-alertworthy] rows", rows.length);
+      const firstRow = rows[0] as { first_alert_time?: string; fdv_at_alert?: unknown } | undefined;
+      console.log("[paid-alertworthy] rows", rows.length, "first_alert_time present:", firstRow != null && "first_alert_time" in firstRow);
       const max_updated_at =
         (data && data.length)
           ? data.reduce((max, r) => (!max || (r as { updated_at?: string }).updated_at > max ? (r as { updated_at?: string }).updated_at : max), null as string | null)
