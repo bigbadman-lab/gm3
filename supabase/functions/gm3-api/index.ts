@@ -653,7 +653,7 @@ Deno.serve(async (req) => {
         }
       }
 
-      const MAX_CAPITAL_EFFICIENCY = 32;
+      const MAX_CAPITAL_EFFICIENCY = 0.32;
       rows = rows.filter((r) => {
         const ce = r.capital_efficiency as number | null | undefined;
         return ce == null || (typeof ce === "number" && !Number.isNaN(ce) && ce <= MAX_CAPITAL_EFFICIENCY);
