@@ -1,4 +1,4 @@
-import md5 from "https://esm.sh/blueimp-md5@2.19.0";
+import md5 from "npm:blueimp-md5@2";
 
 /** MD5 (32-char hex). Legacy: access_sessions may contain this format; lookup supports both MD5 and SHA-256. */
 export function hashSessionToken(token: string): string {

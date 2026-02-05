@@ -1,4 +1,4 @@
-import type { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2";
 import { hashSessionToken, hashSessionTokenSha256 } from "./crypto.ts";
 
 export type Session = { id: string; expires_at: string; tier: string | null };

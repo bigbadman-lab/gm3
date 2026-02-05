@@ -1,5 +1,5 @@
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import md5 from "https://esm.sh/blueimp-md5@2.19.0";
+import { createClient } from "npm:@supabase/supabase-js@2";
+import md5 from "npm:blueimp-md5@2";
 import { hashSessionToken, hashSessionTokenSha256 } from "./lib/crypto.ts";
 import { requireSession } from "./lib/session.ts";
 import { verifyStripeWebhook } from "./lib/stripe_webhook.ts";
@@ -277,6 +277,58 @@ Deno.serve(async (req) => {
       revoked: false,
     });
     if (insertError) return json({ ok: false, error: "db_error" }, 500);
+    return json({ ok: true, token, tier, expires_at });
+  }
+
+  // POST /v1/auth/mint/promo — redeem promo code for gm3_sess_* token (public, no auth)
+  if (req.method === "POST" && path === "/v1/auth/mint/promo") {
+    const body = await parseJsonBody(req);
+    const rawCode = body && typeof body.code === "string" ? body.code : "";
+    const code = rawCode.trim().toUpperCase();
+    if (!code) {
+      return json({ error: "Promo code is required" }, 400);
+    }
+    const svc = getServiceClient();
+    if (!svc) return json({ error: "missing_server_secrets" }, 500);
+
+    const { data: promoRow, error: lookupErr } = await svc
+      .from("promo_codes")
+      .select("id, tier, duration_days, used")
+      .eq("code", code)
+      .maybeSingle();
+    if (lookupErr) return json({ error: "Failed to validate code" }, 500);
+    if (!promoRow) return json({ error: "Invalid promo code" }, 400);
+    if ((promoRow as { used?: boolean }).used) {
+      return json({ error: "This code has already been used" }, 400);
+    }
+
+    const { error: redeemErr } = await svc
+      .from("promo_codes")
+      .update({ used: true, used_at: new Date().toISOString() })
+      .eq("code", code);
+    if (redeemErr) return json({ error: "Failed to redeem code" }, 500);
+
+    const tier = (promoRow as { tier?: string }).tier ?? "investable";
+    const durationDays = Math.max(1, Math.min(365, (promoRow as { duration_days?: number }).duration_days ?? 30));
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+    const token = `gm3_sess_${hex}`;
+    const token_hash = await hashSessionTokenSha256(token);
+    const expiresAt = new Date(Date.now() + durationDays * 24 * 60 * 60 * 1000);
+    const expires_at = expiresAt.toISOString();
+
+    const { error: insertError } = await svc.from("access_sessions").insert({
+      session_token_hash: token_hash,
+      tier,
+      method: "promo",
+      expires_at,
+      revoked: false,
+    });
+    if (insertError) {
+      await svc.from("promo_codes").update({ used: false, used_at: null }).eq("code", code);
+      return json({ error: "Failed to create access session" }, 500);
+    }
     return json({ ok: true, token, tier, expires_at });
   }
 
@@ -600,6 +652,12 @@ Deno.serve(async (req) => {
           }
         }
       }
+
+      const MAX_CAPITAL_EFFICIENCY = 32;
+      rows = rows.filter((r) => {
+        const ce = r.capital_efficiency as number | null | undefined;
+        return ce == null || (typeof ce === "number" && !Number.isNaN(ce) && ce <= MAX_CAPITAL_EFFICIENCY);
+      });
 
       const withRug = rows.map((r) => {
         const buy_count = (r.buy_count as number | null | undefined) ?? 0;
