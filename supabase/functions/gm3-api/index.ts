@@ -1,6 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import md5 from "https://esm.sh/blueimp-md5@2.19.0";
-import { hashSessionToken } from "./lib/crypto.ts";
+import { hashSessionToken, hashSessionTokenSha256 } from "./lib/crypto.ts";
 import { requireSession } from "./lib/session.ts";
 import { verifyStripeWebhook } from "./lib/stripe_webhook.ts";
 
@@ -215,6 +215,20 @@ Deno.serve(async (req) => {
     });
   }
 
+  // POST /v1/auth/revoke — invalidate current session server-side (e.g. "Remove access"). Uses requireSession (matches both MD5 and SHA-256 hashes); updates by session.id; returns 200 { ok: true, revoked: true }.
+  if (req.method === "POST" && path === "/v1/auth/revoke") {
+    const svc = getServiceClient();
+    if (!svc) return json({ error: "missing_server_secrets" }, 500);
+    const check = await requireSession(req, svc);
+    if (!check.ok) return json(check.body, check.status);
+    const { error: revokeErr } = await svc
+      .from("access_sessions")
+      .update({ revoked: true })
+      .eq("id", check.session.id);
+    if (revokeErr) return json({ ok: false, error: "revoke_failed" }, 500);
+    return json({ ok: true, revoked: true }, 200);
+  }
+
   // POST /v1/auth/mint/stripe — exchange confirmed Stripe session for gm3_sess_ token.
   // curl -i -sS "https://api.gm3.fun/functions/v1/gm3-api/v1/auth/mint/stripe" -H "Content-Type: application/json" -d '{"session_id":"cs_test_123"}'
   if (req.method === "POST" && path === "/v1/auth/mint/stripe") {
@@ -253,7 +267,7 @@ Deno.serve(async (req) => {
     crypto.getRandomValues(bytes);
     const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
     const token = `gm3_sess_${hex}`;
-    const token_hash = hashSessionToken(token);
+    const token_hash = await hashSessionTokenSha256(token);
     const expires_at = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
     const { error: insertError } = await svc.from("access_sessions").insert({
       session_token_hash: token_hash,
@@ -390,7 +404,7 @@ Deno.serve(async (req) => {
     crypto.getRandomValues(bytes);
     const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
     const token = `gm3_sess_${hex}`;
-    const token_hash = hashSessionToken(token);
+    const token_hash = await hashSessionTokenSha256(token);
     const { data: insertedRows, error: insertErr } = await svc
       .from("access_sessions")
       .insert({

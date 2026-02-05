@@ -1,5 +1,10 @@
 -- View: one row per mint with FDV at first alert (for joining into paid feeds).
-create or replace view public.token_first_alerts as
+-- Idempotent across object types: drop view/materialized view/table if present (e.g. token_first_alerts was once a table).
+drop view if exists public.token_first_alerts cascade;
+drop materialized view if exists public.token_first_alerts cascade;
+drop table if exists public.token_first_alerts cascade;
+
+create view public.token_first_alerts as
 select mint, entry_fdv_usd as first_alert_fdv_usd
 from public.mint_entries
 where entry_fdv_usd is not null;
@@ -7,7 +12,8 @@ where entry_fdv_usd is not null;
 grant select on public.token_first_alerts to anon, authenticated;
 
 -- Add first_alert_fdv_usd to paid alertworthy (left join token_first_alerts).
-drop view if exists public.v_paid_alertworthy_60;
+-- CASCADE drops dependents (e.g. v_investable_promo_candidates_60, v_alertworthy_mints_60m and their dependents) so this migration can run.
+drop view if exists public.v_paid_alertworthy_60 cascade;
 
 create view public.v_paid_alertworthy_60 as
 select
@@ -22,7 +28,7 @@ left join public.token_first_alerts tfa on tfa.mint = l.mint;
 grant select on public.v_paid_alertworthy_60 to anon, authenticated;
 
 -- Add first_alert_fdv_usd to paid investable (left join token_first_alerts).
-drop view if exists public.v_paid_investable_60;
+drop view if exists public.v_paid_investable_60 cascade;
 
 create view public.v_paid_investable_60 as
 select

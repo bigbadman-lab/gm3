@@ -1,0 +1,5 @@
+# PR note: CASCADE in 20260203220000_token_first_alerts_and_paid_views.sql
+
+**Why CASCADE was added:** This migration drops and recreates `v_paid_alertworthy_60` and `v_paid_investable_60`. In deployed DBs, other views already depend on these (e.g. `v_investable_promo_candidates_60` → `v_paid_alertworthy_60`; `v_alertworthy_mints_60m` → `v_paid_alertworthy_60`; `v_investable_eval_from_alertworthy_60m` → `v_alertworthy_mints_60m`). A plain `DROP VIEW` fails with “cannot drop view because other objects depend on it.” Using `DROP VIEW ... CASCADE` drops the target view and its dependents so the migration can run; any dependent views that need to exist must be recreated in later migrations or outside this file. No business logic or view definitions were changed—only the drop is made idempotent.
+
+**token_first_alerts:** The same migration now makes `token_first_alerts` idempotent regardless of existing object type: it runs `DROP VIEW`, `DROP MATERIALIZED VIEW`, and `DROP TABLE` (each with CASCADE) before `CREATE VIEW`, so it works whether the object was previously a view, materialized view, or table.
