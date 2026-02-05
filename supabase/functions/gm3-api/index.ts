@@ -559,21 +559,71 @@ Deno.serve(async (req) => {
     }
 
     if (req.method === "GET" && path === "/v1/paid/alertworthy") {
+      const url = new URL(req.url);
+      const backfillMint = url.searchParams.get("mint")?.trim() || null;
+
+      let rows: Record<string, unknown>[] = [];
       const { data, error } = await svc
         .from("v_paid_alertworthy_60")
         .select("*")
         .order("updated_at", { ascending: false })
         .limit(25);
       if (error) return json({ error: "query_failed", details: error.message }, 500);
-      const rows = data ?? [];
-      const firstRow = rows[0] as { first_alert_time?: string; fdv_at_alert?: unknown } | undefined;
-      console.log("[paid-alertworthy] rows", rows.length, "first_alert_time present:", firstRow != null && "first_alert_time" in firstRow);
+      rows = (data ?? []) as Record<string, unknown>[];
+
+      if (backfillMint && !rows.some((r) => r.mint === backfillMint)) {
+        const { data: snapIds } = await svc
+          .from("trending_snapshots")
+          .select("id")
+          .eq("window_seconds", 60)
+          .order("window_end", { ascending: false })
+          .limit(100);
+        const ids = ((snapIds ?? []) as { id: string }[]).map((s) => s.id);
+        if (ids.length) {
+          const { data: backfillRow } = await svc
+            .from("trending_items")
+            .select("*")
+            .in("snapshot_id", ids)
+            .eq("mint", backfillMint)
+            .eq("is_alertworthy", true)
+            .order("updated_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          if (backfillRow) {
+            const ti = backfillRow as Record<string, unknown>;
+            const { data: meRow } = await svc.from("mint_entries").select("first_alert_ts, entry_fdv_usd").eq("mint", backfillMint).maybeSingle();
+            const { data: tfaRow } = await svc.from("token_first_alerts").select("first_alert_fdv_usd").eq("mint", backfillMint).maybeSingle();
+            const me = meRow as { first_alert_ts?: string; entry_fdv_usd?: number } | null;
+            const tfa = tfaRow as { first_alert_fdv_usd?: number } | null;
+            const augmented: Record<string, unknown> = { ...ti, first_alert_time: me?.first_alert_ts ?? null, fdv_at_alert: me?.entry_fdv_usd ?? null, first_alert_fdv_usd: tfa?.first_alert_fdv_usd ?? null };
+            rows = [augmented, ...rows].slice(0, 25);
+          }
+        }
+      }
+
+      const withRug = rows.map((r) => {
+        const buy_count = (r.buy_count as number | null | undefined) ?? 0;
+        const sell_count = (r.sell_count as number | null | undefined) ?? 0;
+        const total_trades = buy_count + sell_count;
+        const buy_ratio = r.buy_ratio as number | null | undefined;
+        let rug_risk = false;
+        let rug_risk_reason: string | null = null;
+        if (total_trades >= 15 && buy_ratio != null && buy_ratio > 0.7) {
+          rug_risk = true;
+          rug_risk_reason = "High buy ratio (>0.70) after meaningful volume";
+        }
+        return { ...r, rug_risk, rug_risk_reason };
+      });
+
       const max_updated_at =
-        (data && data.length)
-          ? data.reduce((max, r) => (!max || (r as { updated_at?: string }).updated_at > max ? (r as { updated_at?: string }).updated_at : max), null as string | null)
+        withRug.length
+          ? withRug.reduce((max, r) => {
+              const u = (r as Record<string, unknown>).updated_at as string | undefined;
+              return !max || (u != null && u > max) ? (u ?? max) : max;
+            }, null as string | null)
           : null;
       return json({
-        data: rows,
+        data: withRug,
         server_time: new Date().toISOString(),
         max_updated_at,
       });
