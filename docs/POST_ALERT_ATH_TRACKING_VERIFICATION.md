@@ -89,7 +89,7 @@ if (is_qualified) {
 ```sql
 new.is_alertworthy :=
   (new.is_qualified is true)
-  and (new.net_sol_inflow between 20 and 70)
+  and (new.net_sol_inflow between 10 and 70)
   and (new.mc_structure_ok is true);
 ```
 

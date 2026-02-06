@@ -19,6 +19,95 @@ const WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 const LAMPORTS_PER_SOL = 1e9
 
+/** Payload for trending_items upsert. All NOT NULL columns must have values (no null). */
+type TrendingItemUpsert = {
+  snapshot_id: string
+  rank: number
+  mint: string
+  swap_count: number
+  fdv_usd: number | null
+  updated_at: string
+  signal_touch_count: number
+  signal_point_count: number
+  buy_count: number
+  sell_count: number
+  unique_buyers: number
+  net_sol_inflow: number
+  buy_ratio: number
+  is_qualified: boolean
+  top_buyer_share: number
+  repeat_buyer_ratio: number
+  is_alertworthy: boolean
+  inflow_score: number
+  capital_efficiency: number
+  mc_floor_ok: boolean
+  mc_floor_reason: string
+  mc_structure_ok: boolean
+  mc_structure_reason: string
+}
+
+/** Required non-null defaults for trending_items NOT NULL columns. Never send null for these. */
+function requiredDefaults(nowIso: string): Pick<
+  TrendingItemUpsert,
+  | "updated_at"
+  | "signal_touch_count"
+  | "signal_point_count"
+  | "top_buyer_share"
+  | "repeat_buyer_ratio"
+  | "is_alertworthy"
+  | "inflow_score"
+  | "capital_efficiency"
+  | "mc_floor_ok"
+  | "mc_floor_reason"
+  | "mc_structure_ok"
+  | "mc_structure_reason"
+> {
+  return {
+    updated_at: nowIso,
+    signal_touch_count: 0,
+    signal_point_count: 0,
+    top_buyer_share: 0,
+    repeat_buyer_ratio: 0,
+    is_alertworthy: false,
+    inflow_score: 0,
+    capital_efficiency: 0,
+    mc_floor_ok: false,
+    mc_floor_reason: "missing",
+    mc_structure_ok: false,
+    mc_structure_reason: "missing",
+  }
+}
+
+/** Build one trending_items row with all NOT NULL columns set (safe for upsert). Trigger may overwrite inflow/mc/alertworthy on insert. */
+function buildTrendingItemRow(
+  snapshotId: string,
+  rank: number,
+  c: { mint: string; swap_count: number; buy_count: number; sell_count: number; unique_buyers: number; net_sol_inflow: number; buy_ratio: number },
+  signalTouchCount: number,
+  signalPointCount: number,
+  nowIso: string
+): TrendingItemUpsert {
+  const defaults = requiredDefaults(nowIso)
+  return {
+    ...defaults,
+    snapshot_id: snapshotId,
+    rank,
+    mint: c.mint,
+    swap_count: c.swap_count,
+    fdv_usd: null,
+
+    signal_touch_count: signalTouchCount,
+    signal_point_count: signalPointCount,
+
+    buy_count: c.buy_count,
+    sell_count: c.sell_count,
+    unique_buyers: c.unique_buyers,
+    net_sol_inflow: c.net_sol_inflow,
+    buy_ratio: c.buy_ratio,
+    is_qualified: true,
+  }
+}
+
 type HeliusTx = {
   signature?: string
   timestamp?: number
@@ -224,7 +313,14 @@ async function aggregateAndUpsertWindow(
   windowEndMs: number,
   txs: HeliusTx[],
   signalWalletToWeight: Map<string, number>
-): Promise<{ snapshot_id: string; items_inserted: number; window_end: string; mints_extracted: number; qualified_count: number }> {
+): Promise<{
+  snapshot_id: string
+  items_inserted: number
+  window_end: string
+  mints_extracted: number
+  qualified_count: number
+  best_near_miss?: { swap_count: number; unique_buyers: number; buy_ratio: number; net_sol_inflow: number }
+}> {
   const windowEndSec = Math.floor(windowEndMs / 1000)
   const windowStartSec = windowEndSec - WINDOW_SECONDS
   const windowEndIso = new Date(windowEndMs).toISOString()
@@ -310,21 +406,42 @@ async function aggregateAndUpsertWindow(
     })
     .slice(0, MAX_QUALIFIED_PER_WINDOW)
 
-  const items = sorted.map((c, i) => ({
-    snapshot_id: snapshotId,
-    rank: i + 1,
-    mint: c.mint,
-    swap_count: c.swap_count,
-    fdv_usd: null,
-    signal_touch_count: signalTouchCountByMint.get(c.mint) ?? 0,
-    signal_points: signalPointsByMint.get(c.mint) ?? 0,
-    buy_count: c.buy_count,
-    sell_count: c.sell_count,
-    unique_buyers: c.unique_buyers,
-    net_sol_inflow: c.net_sol_inflow,
-    buy_ratio: c.buy_ratio,
-    is_qualified: true,
-  }))
+  let best_near_miss: { swap_count: number; unique_buyers: number; buy_ratio: number; net_sol_inflow: number } | undefined
+  if (swapCountByMint.size > 0 && sorted.length === 0) {
+    const qualifiedMints = new Set(sorted.map((c) => c.mint))
+    let best: { mint: string; swap_count: number; unique_buyers: number; buy_ratio: number; net_sol_inflow: number } | null = null
+    for (const [mint, swap_count] of swapCountByMint.entries()) {
+      if (qualifiedMints.has(mint)) continue
+      const buy_count = Math.max(0, buyCountByMint.get(mint) ?? 0)
+      const sell_count = Math.max(0, sellCountByMint.get(mint) ?? 0)
+      const unique_buyers = Math.max(0, uniqueBuyersByMint.get(mint)?.size ?? 0)
+      const total_buy_sol = Math.max(0, buySolByMint.get(mint) ?? 0)
+      const total_sell_sol = Math.max(0, sellSolByMint.get(mint) ?? 0)
+      const net_sol_inflow = Math.max(0, total_buy_sol - total_sell_sol)
+      const total_swaps = buy_count + sell_count
+      const buy_ratio = total_swaps === 0 ? 0 : Math.min(1, Math.max(0, buy_count / total_swaps))
+      if (best == null || swap_count > best.swap_count) {
+        best = { mint, swap_count, unique_buyers, buy_ratio, net_sol_inflow }
+      }
+    }
+    if (best) best_near_miss = { swap_count: best.swap_count, unique_buyers: best.unique_buyers, buy_ratio: best.buy_ratio, net_sol_inflow: best.net_sol_inflow }
+  }
+
+  const nowIso = new Date().toISOString()
+  // NOT NULL columns we satisfy: snapshot_id, rank, mint, swap_count, updated_at, signal_touch_count,
+  // signal_point_count, buy_count, sell_count, unique_buyers, net_sol_inflow, buy_ratio, is_qualified,
+  // top_buyer_share, repeat_buyer_ratio, is_alertworthy, inflow_score, capital_efficiency, mc_floor_ok,
+  // mc_floor_reason, mc_structure_ok, mc_structure_reason. Never send null for these.
+  const items: TrendingItemUpsert[] = sorted.map((c, i) =>
+    buildTrendingItemRow(
+      snapshotId,
+      i + 1,
+      c,
+      signalTouchCountByMint.get(c.mint) ?? 0,
+      signalPointsByMint.get(c.mint) ?? 0,
+      nowIso
+    )
+  )
 
   let itemsInserted = 0
   if (items.length > 0) {
@@ -339,6 +456,7 @@ async function aggregateAndUpsertWindow(
     window_end: windowEndIso,
     mints_extracted: swapCountByMint.size,
     qualified_count: sorted.length,
+    best_near_miss: best_near_miss,
   }
 }
 
@@ -502,6 +620,10 @@ Deno.serve(async (req) => {
         mints_extracted: result.mints_extracted,
         qualified_count: result.qualified_count,
         items_upserted: result.items_inserted,
+        ...(result.best_near_miss && {
+          best_near_miss: result.best_near_miss,
+          qual_thresholds: "unique_buyers>=5, buy_ratio>=0.65, net_sol_inflow>=1, swap_count>=10",
+        }),
       })
       windows.push({
         window_end: result.window_end,
@@ -510,7 +632,7 @@ Deno.serve(async (req) => {
       })
     }
 
-    if (processed_tx_count > 0 && newLastSignature != null) {
+    if (newLastSignature != null) {
       const { error: updateErr } = await supabase
         .from("ingest_state")
         .update({ last_signature: newLastSignature, updated_at: new Date().toISOString() })
@@ -575,7 +697,15 @@ Deno.serve(async (req) => {
             ) continue
             const { data: updatedRows, error: updateErr } = await supabase
               .from("trending_items")
-              .update({ price_usd, total_supply, fdv_usd, updated_at: new Date().toISOString() })
+              .update({
+                price_usd,
+                total_supply,
+                fdv_usd,
+                updated_at: new Date().toISOString(),
+                capital_efficiency: 0,
+                inflow_score: 0,
+                is_alertworthy: false,
+              })
               .eq("mint", mint)
               .select("is_alertworthy")
             if (!updateErr) {

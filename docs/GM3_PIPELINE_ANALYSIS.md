@@ -88,7 +88,7 @@
 
 ### 10. Alert logic (trigger)
 - **Where:** `set_inflow_signal_fields()` in migration 015; runs on insert/update of (net_sol_inflow, is_qualified, fdv_usd) on trending_items.
-- **Conditionals:** `is_alertworthy = (is_qualified IS TRUE) AND (net_sol_inflow BETWEEN 20 AND 70) AND (mc_structure_ok IS TRUE)`. mc_structure_ok: fdv_usd >= 10000 and (fdv &lt; 15k → capital_efficiency <= 0.7, else <= 1.0); capital_efficiency = (net_sol_inflow * 200) / fdv_usd.
+- **Conditionals:** `is_alertworthy = (is_qualified IS TRUE) AND (net_sol_inflow BETWEEN 10 AND 70) AND (mc_structure_ok IS TRUE)`. mc_structure_ok: fdv_usd >= 8000 and (fdv &lt; 15k → capital_efficiency <= 0.7, else <= 1.0); capital_efficiency = (net_sol_inflow * 200) / fdv_usd.
 - **DB write:** trending_items (inflow_*, mc_floor_*, capital_efficiency, mc_structure_*, is_alertworthy).
 
 ### 11. v1-today (read path)
@@ -114,8 +114,8 @@
   - `is_qualified = true`
   - `net_sol_inflow BETWEEN 20 AND 70` (inflow “band”)
   - `mc_structure_ok = true`
-- **mc_structure_ok:** fdv_usd >= 10000 and capital_efficiency within band: if fdv_usd &lt; 15000 then (net_sol_inflow*200/fdv_usd) <= 0.7, else <= 1.0.
-- **Where:** `set_inflow_signal_fields()` in `015_capital_efficiency_and_mc_structure.sql`; `is_alertworthy := (is_qualified is true) and (net_sol_inflow between 20 and 70) and (mc_structure_ok is true)`.
+- **mc_structure_ok:** fdv_usd >= 8000 and capital_efficiency within band: if fdv_usd &lt; 15000 then (net_sol_inflow*200/fdv_usd) <= 0.7, else <= 1.0.
+- **Where:** `set_inflow_signal_fields()` in `015_capital_efficiency_and_mc_structure.sql`; `is_alertworthy := (is_qualified is true) and (net_sol_inflow between 10 and 70) and (mc_structure_ok is true)`.
 - **Persistence:** Column `trending_items.is_alertworthy`; updated by trigger on insert/update of net_sol_inflow, is_qualified, fdv_usd.
 
 ### Implicit gates (no explicit “qualified_at” or “alertworthy_at”)

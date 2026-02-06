@@ -14,22 +14,22 @@ set
     else (net_sol_inflow * 200.0) / fdv_usd
   end,
   mc_structure_ok = case
-    when fdv_usd is null or fdv_usd < 10000 then false
+    when fdv_usd is null or fdv_usd < 8000 then false
     when fdv_usd < 15000 then (coalesce((net_sol_inflow * 200.0) / nullif(fdv_usd, 0), 1e9) <= 0.7)
     else (coalesce((net_sol_inflow * 200.0) / nullif(fdv_usd, 0), 1e9) <= 1.0)
   end,
   mc_structure_reason = case
     when fdv_usd is null then 'missing'
-    when fdv_usd < 10000 then 'fdv_too_low'
+    when fdv_usd < 8000 then 'fdv_too_low'
     when fdv_usd < 15000 and (net_sol_inflow * 200.0) / nullif(fdv_usd, 0) > 0.7 then 'eff_too_high_lowfdv'
     when fdv_usd >= 15000 and (net_sol_inflow * 200.0) / nullif(fdv_usd, 0) > 1.0 then 'eff_too_high'
     else 'ok'
   end,
   is_alertworthy = (
     is_qualified is true
-    and net_sol_inflow between 20 and 70
+    and net_sol_inflow between 10 and 70
     and case
-      when fdv_usd is null or fdv_usd < 10000 then false
+      when fdv_usd is null or fdv_usd < 8000 then false
       when fdv_usd < 15000 then (coalesce((net_sol_inflow * 200.0) / nullif(fdv_usd, 0), 1e9) <= 0.7)
       else (coalesce((net_sol_inflow * 200.0) / nullif(fdv_usd, 0), 1e9) <= 1.0)
     end
@@ -44,49 +44,49 @@ as $$
 declare
   eff numeric;
 begin
-  -- Inflow-derived fields (unchanged)
+  -- Inflow-derived fields (inflow band 10–70 SOL)
   if new.net_sol_inflow is null then
     new.inflow_band_ok := null;
     new.inflow_band_reason := 'missing';
     new.inflow_score := null;
   else
-    new.inflow_band_ok := (new.net_sol_inflow >= 20 and new.net_sol_inflow <= 70);
+    new.inflow_band_ok := (new.net_sol_inflow >= 10 and new.net_sol_inflow <= 70);
     new.inflow_band_reason :=
       case
-        when new.net_sol_inflow < 20 then 'too_low'
+        when new.net_sol_inflow < 10 then 'too_low'
         when new.net_sol_inflow > 70 then 'too_high'
         else 'ok'
       end;
     new.inflow_score :=
       case
-        when new.net_sol_inflow between 20 and 70 then 1.0
-        when new.net_sol_inflow < 20 then greatest(0, 1 - ((20 - new.net_sol_inflow) / 10.0))
+        when new.net_sol_inflow between 10 and 70 then 1.0
+        when new.net_sol_inflow < 10 then greatest(0, 1 - ((10 - new.net_sol_inflow) / 10.0))
         else greatest(0, 1 - ((new.net_sol_inflow - 70) / 20.0))
       end;
   end if;
 
-  -- Market-cap floor (fdv_usd as MC proxy; < 10000 = likely sniped/noise)
+  -- Market-cap floor (fdv_usd as MC proxy; < 8000 = likely sniped/noise)
   if new.fdv_usd is null then
     new.mc_floor_ok := null;
     new.mc_floor_reason := 'missing';
   else
-    new.mc_floor_ok := (new.fdv_usd >= 10000);
+    new.mc_floor_ok := (new.fdv_usd >= 8000);
     new.mc_floor_reason :=
       case
-        when new.fdv_usd < 10000 then 'too_low'
+        when new.fdv_usd < 8000 then 'too_low'
         else 'ok'
       end;
   end if;
 
-  -- Capital efficiency: (net_sol_inflow * 200) / fdv_usd (placeholder SOL/USD)
+  -- Capital efficiency: (net_sol_inflow * 200) / fdv_usd (placeholder SOL/USD). Use 0 when fdv missing (column may be NOT NULL).
   if new.fdv_usd is null or new.fdv_usd <= 0 then
-    new.capital_efficiency := null;
+    new.capital_efficiency := 0;
     new.mc_structure_ok := false;
     new.mc_structure_reason := 'missing';
   else
     eff := (new.net_sol_inflow * 200.0) / new.fdv_usd;
     new.capital_efficiency := eff;
-    if new.fdv_usd < 10000 then
+    if new.fdv_usd < 8000 then
       new.mc_structure_ok := false;
       new.mc_structure_reason := 'fdv_too_low';
     elsif new.fdv_usd < 15000 then
@@ -108,10 +108,10 @@ begin
     end if;
   end if;
 
-  -- Alertworthy = qualified AND inflow band OK AND mc_structure_ok
+  -- Alertworthy = qualified AND inflow band OK (10–70 SOL) AND mc_structure_ok
   new.is_alertworthy :=
     (new.is_qualified is true)
-    and (new.net_sol_inflow between 20 and 70)
+    and (new.net_sol_inflow between 10 and 70)
     and (new.mc_structure_ok is true);
 
   return new;
