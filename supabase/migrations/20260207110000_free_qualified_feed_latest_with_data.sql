@@ -1,8 +1,15 @@
--- Free qualified feed: use latest 60s snapshot that has at least one qualified item,
+-- Free qualified feed v2: use latest 60s snapshot that has at least one qualified item,
 -- so the API returns data even when the very latest minute has 0 items (e.g. ingest lag).
+--
+-- Created as free_qualified_feed_v2 (not replacing free_qualified_feed) because PROD
+-- already has public.free_qualified_feed() with a different RETURNS TABLE (7 cols from
+-- v_free_qualified_feed_60). Replacing it would raise SQLSTATE 42P13 (cannot change
+-- return type of existing function).
+
+begin;
 
 -- Return type matches layer_qualified (same columns as trending_items for feed).
-create or replace function public.free_qualified_feed()
+create or replace function public.free_qualified_feed_v2()
 returns table (
   snapshot_id uuid,
   rank int,
@@ -73,8 +80,8 @@ as $$
   order by ti.rank;
 $$;
 
--- Meta: one row with window_end and count for the snapshot used by free_qualified_feed.
-create or replace function public.free_qualified_feed_meta()
+-- Meta for free_qualified_feed_v2: one row with window_end and count for the snapshot used by the feed.
+create or replace function public.free_qualified_feed_v2_meta()
 returns table (
   window_end timestamptz,
   item_count bigint
@@ -102,5 +109,7 @@ as $$
   group by l.window_end;
 $$;
 
-grant execute on function public.free_qualified_feed() to anon, authenticated;
-grant execute on function public.free_qualified_feed_meta() to anon, authenticated;
+grant execute on function public.free_qualified_feed_v2() to anon, authenticated;
+grant execute on function public.free_qualified_feed_v2_meta() to anon, authenticated;
+
+commit;

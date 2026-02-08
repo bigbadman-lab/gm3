@@ -5,6 +5,11 @@ export function hashSessionToken(token: string): string {
   return md5(token);
 }
 
+/** Same hash as session_token_hash (MD5). Use for API key lookup so hashes match existing storage. */
+export function hashToken(raw: string): string {
+  return md5(raw);
+}
+
 /** SHA-256 hex (64 chars). New sessions store this; lookup supports both for backward compatibility. */
 export async function hashSessionTokenSha256(token: string): Promise<string> {
   const data = new TextEncoder().encode(token);

@@ -1,7 +1,7 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
 import md5 from "npm:blueimp-md5@2";
-import { hashSessionToken, hashSessionTokenSha256 } from "./lib/crypto.ts";
-import { requireSession } from "./lib/session.ts";
+import { hashSessionToken, hashSessionTokenSha256, hashToken } from "./lib/crypto.ts";
+import { requireSession, type Session } from "./lib/session.ts";
 import { verifyStripeWebhook } from "./lib/stripe_webhook.ts";
 
 export const config = { verify_jwt: false };
@@ -28,14 +28,10 @@ async function md5Hex(input: string): Promise<string> {
     .join("");
 }
 
-// Supabase functions path format: /functions/v1/<fn>/<rest>
-// We want <rest> (e.g. /v1/free/qualified)
-function getRestPath(req: Request): string {
-  const url = new URL(req.url);
-  const parts = url.pathname.split("/").filter(Boolean);
-  const idx = parts.findIndex((p) => p === "gm3-api");
-  if (idx === -1) return "/";
-  return "/" + parts.slice(idx + 1).join("/");
+function normalizePath(req: Request): string {
+  const pathname = new URL(req.url).pathname;
+  const idx = pathname.indexOf("/v1");
+  return idx >= 0 ? pathname.slice(idx) : pathname;
 }
 
 function isString(v: unknown): v is string {
@@ -53,35 +49,134 @@ async function parseJsonBody(req: Request): Promise<Record<string, unknown> | nu
   }
 }
 
-async function requireApiKey(
-  supabase: any,
-  req: Request
-): Promise<{ tier: string; prefix: string } | Response> {
-  const key = (req.headers.get("x-api-key") ?? "").trim();
-  if (!key) return json({ error: "missing_api_key" }, 401);
+/** Generate a raw API key: prefix gm3_key_ + 32 bytes randomness as URL-safe base64 (no padding). */
+function generateRawApiKey(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  const b64 = btoa(binary);
+  const base64url = b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return `gm3_key_${base64url}`;
+}
 
-  const keyHash = md5(key);
+/** Cached: does public.api_keys have a NOT NULL "prefix" column? (legacy PROD schema). Set once per edge instance. */
+let apiKeysHasPrefixColumn: boolean | null = null;
 
-  const { data, error } = await supabase
-    .from("api_keys")
-    .select("tier, prefix, revoked_at, expires_at")
-    .eq("key_hash", keyHash)
+/** Detect whether api_keys has a "prefix" column via catalog; cache result. Returns null if catalog not queryable (e.g. PostgREST). */
+async function apiKeysTableHasPrefixColumn(
+  svc: ReturnType<typeof createClient>
+): Promise<boolean | null> {
+  if (apiKeysHasPrefixColumn !== null) return apiKeysHasPrefixColumn;
+  const { data, error } = await svc
+    .schema("information_schema")
+    .from("columns")
+    .select("column_name")
+    .eq("table_schema", "public")
+    .eq("table_name", "api_keys")
+    .eq("column_name", "prefix")
     .maybeSingle();
+  if (!error && data) {
+    apiKeysHasPrefixColumn = true;
+    return true;
+  }
+  if (!error && !data) {
+    apiKeysHasPrefixColumn = false;
+    return false;
+  }
+  return null;
+}
 
-  if (error) return json({ error: "key_lookup_failed", details: error.message }, 500);
-  if (!data) return json({ error: "invalid_api_key" }, 401);
-  if (data.revoked_at) return json({ error: "revoked_api_key" }, 401);
+/** Client IP: x-forwarded-for (first) -> x-real-ip -> cf-connecting-ip -> null */
+function getClientIp(req: Request): string | null {
+  const xff = req.headers.get("x-forwarded-for");
+  if (xff) {
+    const first = xff.split(",")[0]?.trim();
+    if (first) return first;
+  }
+  const xri = req.headers.get("x-real-ip")?.trim();
+  if (xri) return xri;
+  const cf = req.headers.get("cf-connecting-ip")?.trim();
+  if (cf) return cf;
+  return null;
+}
 
-  if (data.expires_at && new Date(data.expires_at).getTime() <= Date.now()) {
-    return json({ error: "expired_api_key" }, 401);
+export type AuthResult =
+  | { ok: true; session: Session }
+  | { ok: true; authType: "api_key"; access_session_id: string; session: Session }
+  | { ok: false; status: 401; body: { ok: false; error: string } };
+
+/** Validates Authorization: Bearer gm3_key_* against api_keys + access_sessions. Updates last_used_at, last_used_ip. */
+async function requireApiKey(
+  req: Request,
+  svc: ReturnType<typeof createClient>
+): Promise<AuthResult> {
+  const auth = (req.headers.get("Authorization") ?? "").trim();
+  if (!auth.toLowerCase().startsWith("bearer ")) {
+    return { ok: false, status: 401, body: { ok: false, error: "missing_or_invalid_token" } };
+  }
+  const rawKey = auth.slice(7).trim();
+  if (!rawKey.startsWith("gm3_key_")) {
+    return { ok: false, status: 401, body: { ok: false, error: "missing_or_invalid_token" } };
   }
 
-  supabase
+  const key_hash = hashToken(rawKey);
+  const { data: keyRow, error: keyErr } = await svc
     .from("api_keys")
-    .update({ last_used_at: new Date().toISOString() })
-    .eq("key_hash", keyHash);
+    .select("access_session_id")
+    .eq("key_hash", key_hash)
+    .eq("is_active", true)
+    .maybeSingle();
 
-  return { tier: data.tier ?? "paid", prefix: data.prefix ?? "" };
+  if (keyErr) return { ok: false, status: 401, body: { ok: false, error: "invalid_api_key" } };
+  if (!keyRow) return { ok: false, status: 401, body: { ok: false, error: "invalid_api_key" } };
+
+  const access_session_id = (keyRow as { access_session_id: string }).access_session_id;
+  const nowIso = new Date().toISOString();
+  const { data: sessionRow, error: sessionErr } = await svc
+    .from("access_sessions")
+    .select("id, expires_at, tier")
+    .eq("id", access_session_id)
+    .eq("revoked", false)
+    .gt("expires_at", nowIso)
+    .maybeSingle();
+
+  if (sessionErr) return { ok: false, status: 401, body: { ok: false, error: "invalid_api_key" } };
+  if (!sessionRow) return { ok: false, status: 401, body: { ok: false, error: "invalid_api_key" } };
+
+  const session: Session = {
+    id: (sessionRow as { id: string }).id,
+    expires_at: (sessionRow as { expires_at: string }).expires_at,
+    tier: (sessionRow as { tier: string | null }).tier ?? null,
+  };
+
+  const clientIp = getClientIp(req);
+  const updatePayload: { last_used_at: string; last_used_ip?: string } = { last_used_at: nowIso };
+  if (clientIp != null && clientIp.length > 0) updatePayload.last_used_ip = clientIp;
+  await svc.from("api_keys").update(updatePayload).eq("key_hash", key_hash);
+
+  return { ok: true, authType: "api_key", access_session_id, session };
+}
+
+/** Session or API key: Bearer gm3_sess_* -> requireSession; Bearer gm3_key_* -> requireApiKey; else 401. */
+async function requireAuth(
+  req: Request,
+  svc: ReturnType<typeof createClient>
+): Promise<AuthResult> {
+  const auth = (req.headers.get("Authorization") ?? "").trim();
+  if (!auth.toLowerCase().startsWith("bearer ")) {
+    return { ok: false, status: 401, body: { ok: false, error: "missing_or_invalid_token" } };
+  }
+  const token = auth.slice(7).trim();
+  if (token.startsWith("gm3_sess_")) {
+    const result = await requireSession(req, svc);
+    if (!result.ok) return result;
+    return { ok: true, session: result.session };
+  }
+  if (token.startsWith("gm3_key_")) {
+    return requireApiKey(req, svc);
+  }
+  return { ok: false, status: 401, body: { ok: false, error: "missing_or_invalid_token" } };
 }
 
 function getServiceClient(): ReturnType<typeof createClient> | null {
@@ -95,7 +190,7 @@ function getServiceClient(): ReturnType<typeof createClient> | null {
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return json({ ok: true }, 200);
 
-  const path = getRestPath(req);
+  const path = normalizePath(req);
 
   if (req.method === "GET" && path === "/v1/_debug/path") {
     return json({
@@ -227,6 +322,104 @@ Deno.serve(async (req) => {
       .eq("id", check.session.id);
     if (revokeErr) return json({ ok: false, error: "revoke_failed" }, 500);
     return json({ ok: true, revoked: true }, 200);
+  }
+
+  // -------- API keys (session-gated only; reject gm3_key_* callers) --------
+  // POST /v1/api-keys — create key; body: { label?: string }; returns raw key once.
+  if (req.method === "POST" && path === "/v1/api-keys") {
+    const svc = getServiceClient();
+    if (!svc) return json({ error: "missing_server_secrets" }, 500);
+    const check = await requireSession(req, svc);
+    if (!check.ok) return json(check.body, check.status);
+    const body = await parseJsonBody(req);
+    const rawLabel = body && isString(body.label) ? body.label.trim() : null;
+    const label = rawLabel && rawLabel.length > 0
+      ? rawLabel.slice(0, 64)
+      : null;
+    const access_session_id = check.session.id;
+    let needsPrefix: boolean | null = await apiKeysTableHasPrefixColumn(svc);
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const rawKey = generateRawApiKey();
+      const key_hash = hashToken(rawKey);
+      const insertPayload: Record<string, unknown> = {
+        access_session_id,
+        key_hash,
+        label,
+        is_active: true,
+      };
+      if (needsPrefix === true) insertPayload.prefix = "gm3_key";
+      const { data: row, error } = await svc
+        .from("api_keys")
+        .insert(insertPayload)
+        .select("id, created_at")
+        .single();
+      if (!error) {
+        if (needsPrefix === null) apiKeysHasPrefixColumn = false;
+        const r = row as { id: string; created_at: string };
+        return json({
+          api_key: rawKey,
+          id: r.id,
+          label,
+          created_at: r.created_at,
+        });
+      }
+      if ((error as { code?: string }).code === "23505") {
+        lastError = error;
+        continue;
+      }
+      if ((error as { code?: string; message?: string }).code === "23502") {
+        const msg = String((error as { message?: string }).message ?? "");
+        if (msg.includes("prefix")) {
+          apiKeysHasPrefixColumn = true;
+          needsPrefix = true;
+          continue;
+        }
+      }
+      return json({ error: "db_error", details: (error as Error).message }, 500);
+    }
+    return json({ error: "db_error", details: "key_hash collision after retries" }, 500);
+  }
+
+  // GET /v1/api-keys — list keys for current session (metadata only; no raw key, no key_hash).
+  if (req.method === "GET" && path === "/v1/api-keys") {
+    const svc = getServiceClient();
+    if (!svc) return json({ error: "missing_server_secrets" }, 500);
+    const check = await requireSession(req, svc);
+    if (!check.ok) return json(check.body, check.status);
+    const { data: rows, error } = await svc
+      .from("api_keys")
+      .select("id, label, is_active, created_at, revoked_at, last_used_at, last_used_ip")
+      .eq("access_session_id", check.session.id)
+      .order("created_at", { ascending: false });
+    if (error) return json({ error: "db_error", details: (error as Error).message }, 500);
+    return json({ keys: rows ?? [] });
+  }
+
+  // POST /v1/api-keys/:id/revoke — revoke key; must belong to current session.
+  const revokeMatch = path.match(/^\/v1\/api-keys\/([^/]+)\/revoke$/);
+  if (req.method === "POST" && revokeMatch) {
+    const keyId = revokeMatch[1];
+    const svc = getServiceClient();
+    if (!svc) return json({ error: "missing_server_secrets" }, 500);
+    const check = await requireSession(req, svc);
+    if (!check.ok) return json(check.body, check.status);
+    const nowIso = new Date().toISOString();
+    const { data: keyRow, error: fetchErr } = await svc
+      .from("api_keys")
+      .select("id")
+      .eq("id", keyId)
+      .eq("access_session_id", check.session.id)
+      .maybeSingle();
+    if (fetchErr) return json({ error: "db_error" }, 500);
+    if (!keyRow) return json({ error: "not_found" }, 404);
+    const { error: updateErr } = await svc
+      .from("api_keys")
+      .update({ is_active: false, revoked_at: nowIso })
+      .eq("id", keyId)
+      .eq("access_session_id", check.session.id);
+    if (updateErr) return json({ error: "revoke_failed" }, 500);
+    return json({ ok: true });
   }
 
   // POST /v1/auth/mint/stripe — exchange confirmed Stripe session for gm3_sess_ token.
@@ -601,7 +794,7 @@ Deno.serve(async (req) => {
   if (path.startsWith("/v1/paid/")) {
     const svc = getServiceClient();
     if (!svc) return json({ error: "missing_server_secrets" }, 500);
-    const check = await requireSession(req, svc);
+    const check = await requireAuth(req, svc);
     if (!check.ok) return json(check.body, check.status);
 
     if (req.method === "GET" && path === "/v1/paid/qualified") {
