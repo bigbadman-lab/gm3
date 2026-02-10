@@ -797,6 +797,74 @@ Deno.serve(async (req) => {
     const check = await requireAuth(req, svc);
     if (!check.ok) return json(check.body, check.status);
 
+    // GET /v1/paid/mints/:mint/decision — first so path param is not swallowed by other paid routes
+    const pathname = path;
+    if (req.method === "GET" && pathname.startsWith("/v1/paid/mints/") && pathname.endsWith("/decision")) {
+      const parts = pathname.split("/");
+      if (parts.length >= 6 && parts[5] === "decision") {
+        const mint = parts[4];
+        const rawMint = mint.trim();
+        const base58 = /^[1-9A-HJ-NP-Za-km-z]+$/;
+        if (rawMint.length < 32 || rawMint.length > 44 || !base58.test(rawMint)) {
+          return json({ error: "invalid_mint", message: "Invalid Solana mint address." }, 400);
+        }
+        const { data: row, error: rpcError } = await svc
+          .rpc("mint_decision", { p_mint: rawMint })
+          .single();
+        if (rpcError) {
+          return json({ error: "rpc_error", message: rpcError.message }, 500);
+        }
+        const r = row as {
+          found: boolean;
+          verdict: string;
+          confidence: number | null;
+          reasons: string[] | null;
+          snapshot_id: string | null;
+          rank: number | null;
+          mint: string;
+          fdv_usd: number | null;
+          buy_ratio: number | null;
+          unique_buyers: number | null;
+          capital_efficiency: number | null;
+          mc_floor_ok: boolean | null;
+          mc_floor_reason: string | null;
+          mc_structure_ok: boolean | null;
+          mc_structure_reason: string | null;
+          inflow_band_ok: boolean | null;
+          inflow_band_reason: string | null;
+          is_alertworthy: boolean | null;
+          is_qualified: boolean | null;
+          first_alert_time: string | null;
+          updated_at: string | null;
+        };
+        return json({
+          mint: r.mint,
+          found: r.found,
+          verdict: r.verdict,
+          confidence: r.confidence,
+          reasons: r.reasons ?? [],
+          metrics: {
+            snapshot_id: r.snapshot_id,
+            rank: r.rank,
+            fdv_usd: r.fdv_usd,
+            buy_ratio: r.buy_ratio,
+            unique_buyers: r.unique_buyers,
+            capital_efficiency: r.capital_efficiency,
+            mc_floor_ok: r.mc_floor_ok,
+            mc_floor_reason: r.mc_floor_reason,
+            mc_structure_ok: r.mc_structure_ok,
+            mc_structure_reason: r.mc_structure_reason,
+            inflow_band_ok: r.inflow_band_ok,
+            inflow_band_reason: r.inflow_band_reason,
+            is_alertworthy: r.is_alertworthy,
+            is_qualified: r.is_qualified,
+            first_alert_time: r.first_alert_time,
+            updated_at: r.updated_at,
+          },
+        });
+      }
+    }
+
     if (req.method === "GET" && path === "/v1/paid/qualified") {
       const { data, error } = await svc.from("v_layer_qualified_60").select("*");
       if (error) return json({ error: "query_failed", details: error.message }, 500);
