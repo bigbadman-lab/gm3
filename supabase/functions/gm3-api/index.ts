@@ -1,6 +1,9 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
 import md5 from "npm:blueimp-md5@2";
 import { hashSessionToken, hashSessionTokenSha256, hashToken } from "./lib/crypto.ts";
+import { computeLiveMetrics, makeLiveVerdict } from "./lib/liveDecision.ts";
+import { getBirdeyeTokenOverview } from "./lib/providers/birdeye.ts";
+import { getHeliusRecentSwapsForMint } from "./lib/providers/helius.ts";
 import { requireSession, type Session } from "./lib/session.ts";
 import { verifyStripeWebhook } from "./lib/stripe_webhook.ts";
 
@@ -861,6 +864,71 @@ Deno.serve(async (req) => {
             first_alert_time: r.first_alert_time,
             updated_at: r.updated_at,
           },
+        });
+      }
+    }
+
+    // GET /v1/paid/mints/:mint/live-decision — live Birdeye + Helius metrics and verdict
+    if (req.method === "GET" && pathname.startsWith("/v1/paid/mints/") && pathname.endsWith("/live-decision")) {
+      const parts = pathname.split("/");
+      if (parts.length >= 6 && parts[5] === "live-decision") {
+        const rawMint = parts[4].trim();
+        const base58 = /^[1-9A-HJ-NP-Za-km-z]+$/;
+        if (rawMint.length < 32 || rawMint.length > 44 || !base58.test(rawMint)) {
+          return json({ error: "invalid_mint", message: "Invalid Solana mint address." }, 400);
+        }
+        const mint = rawMint;
+        const windowSeconds = 300;
+
+        const [birdeye, swaps] = await Promise.all([
+          getBirdeyeTokenOverview(mint),
+          getHeliusRecentSwapsForMint(mint, windowSeconds),
+        ]);
+
+        const fdvUsd = birdeye.fdv_usd ?? null;
+        const liquidityUsd = birdeye.liquidity_usd ?? null;
+
+        const swapInputs = swaps.map((s) => ({
+          ts: s.ts,
+          wallet: s.wallet,
+          side: s.side,
+          sol_amount: s.sol_amount,
+        }));
+
+        const metrics = computeLiveMetrics({
+          swaps: swapInputs,
+          windowSeconds,
+          fdv_usd: fdvUsd,
+          liquidity_usd: liquidityUsd,
+        });
+
+        const { verdict, confidence, reasons } = makeLiveVerdict(metrics);
+
+        if (swaps.length === 0 && fdvUsd == null && reasons.length === 0) {
+          reasons.push("No swap data or FDV available for the last 5 minutes.");
+        }
+
+        return json({
+          mint,
+          source: "live",
+          found: true,
+          verdict,
+          confidence,
+          reasons,
+          metrics: {
+            window_seconds: metrics.window_seconds,
+            observed_from: metrics.observed_from,
+            observed_to: metrics.observed_to,
+            fdv_usd: metrics.fdv_usd,
+            liquidity_usd: metrics.liquidity_usd,
+            buy_ratio: metrics.buy_ratio,
+            unique_buyers: metrics.unique_buyers,
+            capital_efficiency: metrics.capital_efficiency,
+            net_sol_inflow: metrics.net_sol_inflow,
+            buy_count: metrics.buy_count,
+            sell_count: metrics.sell_count,
+          },
+          raw: { swaps_count: swaps.length },
         });
       }
     }
